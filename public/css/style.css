@@ -292,6 +292,12 @@ section.block.soft { background: var(--bg-soft); }
 .tab-panel.active { display: block; }
 
 /* ---------- donate ---------- */
+.donate-sidebar {
+  position: sticky;
+  top: 90px;
+  align-self: start;
+}
+
 .bank-card {
   background: var(--hero-grad); color: #fff; border-radius: calc(var(--radius) + 6px);
   padding: 2.4rem; box-shadow: var(--shadow-lg); position: relative; overflow: hidden;
@@ -463,6 +469,7 @@ section.block.soft { background: var(--bg-soft); }
   .grid-2, .grid-3, .two-col, .form-grid { grid-template-columns: 1fr; }
   .grid-4, .team-grid { grid-template-columns: repeat(2, 1fr); }
   .gallery-grid { grid-template-columns: repeat(2, 1fr); }
+  .donate-sidebar { position: static; top: auto; }
   .brand-text b { font-size: .92rem; }
   .header-donate { display: none; }
 }
