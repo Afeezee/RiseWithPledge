@@ -75,8 +75,9 @@
             </span>
           </a>
           <nav class="main-nav" id="mainNav" aria-label="Main navigation">
+            <button class="nav-close" id="navClose" aria-label="Close menu">✕</button>
             ${NAV_LINKS.map(([id, label, href]) => `<a href="${href}" class="${id === page ? 'active' : ''}">${label}</a>`).join('')}
-            <a href="/donate" class="btn btn-gold btn-sm" style="margin-top:.4rem">Donate</a>
+            <a href="/donate" class="btn btn-gold btn-sm" style="margin-top:.4rem;align-self:stretch;justify-content:center">Donate</a>
           </nav>
           <div class="header-actions">
             <button class="theme-toggle" id="themeToggle" aria-label="Toggle light/dark mode" title="Toggle theme">
@@ -142,9 +143,11 @@
     document.body.appendChild(footer);
 
     document.getElementById('themeToggle').addEventListener('click', toggleTheme);
+    const closeNav = () => document.body.classList.remove('nav-open');
     document.getElementById('navBurger').addEventListener('click', () => document.body.classList.toggle('nav-open'));
-    document.getElementById('navOverlay').addEventListener('click', () => document.body.classList.remove('nav-open'));
-    document.querySelectorAll('#mainNav a').forEach(a => a.addEventListener('click', () => document.body.classList.remove('nav-open')));
+    document.getElementById('navClose').addEventListener('click', closeNav);
+    document.getElementById('navOverlay').addEventListener('click', closeNav);
+    document.querySelectorAll('#mainNav a').forEach(a => a.addEventListener('click', closeNav));
 
     document.getElementById('footerNewsForm').addEventListener('submit', async e => {
       e.preventDefault();
