@@ -1,0 +1,13 @@
+{
+  "name": "Rise With Pledge Foundation",
+  "short_name": "Rise With Pledge",
+  "description": "Rise With Pledge Education Welfare and Empowerment Foundation — advancing education, welfare, and empowerment.",
+  "icons": [
+    { "src": "/img/icon-192.png", "type": "image/png", "sizes": "192x192" },
+    { "src": "/img/icon-512.png", "type": "image/png", "sizes": "512x512" }
+  ],
+  "theme_color": "#0042ab",
+  "background_color": "#0a1a4f",
+  "display": "standalone",
+  "start_url": "/"
+}

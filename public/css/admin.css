@@ -35,7 +35,7 @@ body { background: var(--bg-soft); }
   transition: background .15s;
 }
 .side-nav button:hover { background: rgba(255,255,255,.08); }
-.side-nav button.active { background: var(--gold-500); color: #2a2102; }
+.side-nav button.active { background: var(--sky-500); color: #05243a; }
 .side-nav .pill {
   margin-left: auto; font-style: normal; background: rgba(255,255,255,.14); border-radius: 999px;
   font-size: .7rem; padding: .1rem .5rem; font-weight: 800; min-width: 1.4rem; text-align: center;

@@ -66,8 +66,8 @@
       <header class="site-header">
         <div class="container header-inner">
           <a class="brand" href="/">
-            <span class="brand-mark" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v6m0 0c-3 0-5 2-5 5 0 2 1 4 3 5l2 2 2-2c2-1 3-3 3-5 0-3-2-5-5-5Z"/><path d="m7 6 2 2m8-2-2 2"/></svg>
+            <span class="brand-mark">
+              <img src="/img/logo-mark.png" alt="Rise With Pledge Foundation logo" width="44" height="44" decoding="async">
             </span>
             <span class="brand-text">
               <b>RISE <span class="gold">WITH</span> PLEDGE</b>
@@ -153,7 +153,7 @@
       e.preventDefault();
       const input = e.target.querySelector('input');
       const r = await postJSON('/api/subscribe', { email: input.value });
-      if (r.ok) { toast('Thank you for subscribing! 🌱'); input.value = ''; }
+      if (r.ok) { toast('Thank you for subscribing! 💙'); input.value = ''; }
       else toast(r.error || 'Subscription failed.');
     });
   }
