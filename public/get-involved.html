@@ -220,15 +220,25 @@
           </div>
           <div class="form-card">
             <h3 style="margin-bottom:1.2rem">Partnership Enquiry</h3>
-            <form data-submit="contact" data-success="Thank you! Your partnership enquiry has been received — our team will reach out to discuss collaboration opportunities.">
-              <input type="hidden" name="subject" value="Partnership Enquiry">
+            <form data-submit="partner" data-success="Thank you! Your partnership enquiry has been received — our team will reach out to discuss collaboration opportunities.">
               <div class="form-grid">
                 <div class="field"><label>Contact Person <span class="req">*</span></label><input name="name" required placeholder="Full name"></div>
                 <div class="field"><label>Email Address <span class="req">*</span></label><input type="email" name="email" required placeholder="organisation@example.com"></div>
-                <div class="field full"><label>Phone Number</label><input name="phone" placeholder="+234..."></div>
-                <div class="field full"><label>Tell us about your organisation and proposed partnership</label><textarea name="message" placeholder="Organisation name, type, and the kind of collaboration you have in mind..."></textarea></div>
+                <div class="field"><label>Organisation <span class="req">*</span></label><input name="organisation" required placeholder="Organisation name"></div>
+                <div class="field"><label>Phone Number</label><input name="phone" placeholder="+234..."></div>
+                <div class="field full">
+                  <label>Partnership Type</label>
+                  <select name="partnershipType">
+                    <option>Government agency</option><option>Educational institution</option>
+                    <option>Corporate organisation</option><option>Development partner</option>
+                    <option>Community-based organisation</option><option>Faith-based organisation</option>
+                    <option>Philanthropist / foundation</option><option>Other</option>
+                  </select>
+                </div>
+                <div class="field full"><label>Tell us about your proposed partnership</label><textarea name="message" placeholder="The kind of collaboration you have in mind..."></textarea></div>
               </div>
-              <button class="btn btn-primary" type="submit" style="margin-top:1.3rem">Send Enquiry</button>
+              <p style="color:var(--muted);font-size:.85rem;margin-top:.8rem">By submitting, you consent to receive occasional partnership updates. You can unsubscribe at any time.</p>
+              <button class="btn btn-primary" type="submit" style="margin-top:1rem">Send Enquiry</button>
               <div class="form-msg"></div>
             </form>
           </div>

@@ -34,8 +34,14 @@
       delete opts.json;
     }
     const res = await fetch(url, opts);
-    if (res.status === 401) { showLogin(); throw new Error('Session expired'); }
     const data = await res.json().catch(() => ({}));
+    if (res.status === 401) {
+      // A 401 on /api/admin/login itself is a wrong-password rejection, not a
+      // stale session — surface the server's error and don't bounce to login.
+      if (url === '/api/admin/login') throw new Error(data.error || 'Invalid username or password.');
+      showLogin();
+      throw new Error(data.error || 'Session expired — please sign in again.');
+    }
     if (!res.ok) throw new Error(data.error || 'Request failed');
     return data;
   }
@@ -47,7 +53,8 @@
     members:    { title: 'Membership Applications', desc: 'People who completed the Membership Registration Form. Update each application’s status as you process it.', statuses: ['new', 'contacted', 'approved', 'declined'] },
     volunteers: { title: 'Volunteer Registrations', desc: 'Volunteer sign-ups from the website. Contact them for onboarding and issue certificates on completion.', statuses: ['new', 'contacted', 'approved', 'declined'] },
     pledges:    { title: 'Pledges', desc: 'Pledges dedicated to special occasions. Reach out to coordinate fulfilment.', statuses: ['new', 'contacted', 'fulfilled', 'declined'] },
-    contacts:   { title: 'Contact Messages', desc: 'Messages and partnership enquiries from the contact forms.', statuses: ['new', 'contacted', 'resolved'] },
+    contacts:   { title: 'Contact Messages', desc: 'Messages from the general contact form.', statuses: ['new', 'contacted', 'resolved'] },
+    partners_enquiries: { title: 'Partner Enquiries', desc: 'Organisations that submitted a partnership enquiry.', statuses: ['new', 'contacted', 'approved', 'declined'] },
     newsletter: { title: 'Newsletter Subscribers', desc: 'Email addresses subscribed to your newsletter.', statuses: null }
   };
 
@@ -157,7 +164,7 @@
     updatePills();
   }
   function updatePills() {
-    ['members', 'volunteers', 'pledges', 'contacts', 'newsletter'].forEach(k => {
+    ['members', 'volunteers', 'pledges', 'contacts', 'partners_enquiries', 'newsletter'].forEach(k => {
       const pill = document.querySelector(`[data-pill="${k}"]`);
       if (!pill) return;
       const newCount = (DB[k] || []).filter(x => x.status === 'new').length;
@@ -175,6 +182,7 @@
     document.querySelectorAll('#sideNav button').forEach(b => b.classList.toggle('active', b.dataset.view === view));
     document.body.classList.remove('side-open');
     if (view === 'overview') return renderOverview();
+    if (view === 'campaigns') return renderCampaigns();
     if (SUBMISSION_VIEWS[view]) return renderSubmissions(view);
     if (CONTENT_VIEWS[view]) return renderContent(view);
     if (view === 'impact') return renderImpact();
@@ -185,7 +193,7 @@
     $('#viewTitle').textContent = 'Overview';
     const counts = [
       ['members', '🤝 Members'], ['volunteers', '🙋 Volunteers'], ['pledges', '🎁 Pledges'], ['contacts', '✉️ Messages'],
-      ['newsletter', '📰 Subscribers'], ['projects', '🏗 Projects'], ['gallery', '🖼 Gallery Items'], ['reports', '📄 Reports']
+      ['partners_enquiries', '🏛 Partner Enquiries'], ['newsletter', '📰 Subscribers'], ['projects', '🏗 Projects'], ['gallery', '🖼 Gallery Items']
     ];
     const recent = ['members', 'volunteers', 'pledges', 'contacts']
       .flatMap(k => (DB[k] || []).map(x => ({ ...x, _type: k })))
@@ -499,6 +507,176 @@
         e.target.reset();
         toast('Password updated ✓');
       } catch (err) { toast(err.message, true); }
+    });
+  }
+
+  // ---------------- campaigns ----------------
+  const AUDIENCE_LABELS = {
+    newsletter: '📰 Newsletter subscribers',
+    volunteer:  '🙋 Volunteers',
+    membership: '🤝 Members',
+    pledge:     '🎁 Pledgers / donors',
+    partner:    '🏛 Partners',
+    contact:    '✉️ Contact-form submitters'
+  };
+
+  async function renderCampaigns() {
+    $('#viewTitle').textContent = 'Email Campaigns';
+    wrap().innerHTML = `<div class="empty-state">Loading campaign data…</div>`;
+
+    let counts = null, campaigns = [], brevoConfigured = false;
+    try {
+      const [c1, c2] = await Promise.all([
+        api('/api/admin/subscribers/counts'),
+        api('/api/admin/campaigns')
+      ]);
+      counts = c1.counts;
+      brevoConfigured = !!c1.brevoConfigured;
+      campaigns = c2.campaigns || [];
+    } catch (err) {
+      wrap().innerHTML = `<div class="empty-state" style="color:#b33">
+        Could not load campaign data — ${esc(err.message)}.<br><br>
+        Make sure <code>DATABASE_URL</code> is set on the server.
+      </div>`;
+      return;
+    }
+
+    const audienceKeys = Object.keys(AUDIENCE_LABELS);
+    const totalActive = audienceKeys.reduce((n, k) => n + (counts[k] ? counts[k].active : 0), 0);
+
+    wrap().innerHTML = `
+      <div class="view-head">
+        <p>Compose and send email updates to any combination of subscriber groups. Contacts and unsubscribes are handled by Brevo — the counts here reflect people who are currently opted in.</p>
+      </div>
+
+      ${!brevoConfigured ? `<div class="empty-state" style="color:#b33">
+        <b>Brevo is not configured.</b> Set <code>BREVO_API_KEY</code>, <code>BREVO_SENDER_EMAIL</code>, and each list id on the server before you can send.
+      </div>` : ''}
+
+      <div class="form-section">
+        <h3>Brevo diagnostics</h3>
+        <p style="color:var(--muted);font-size:.9rem">Runs a read-only check against Brevo — confirms the API key, sender verification, and every configured list id. Use this when welcome emails aren't landing.</p>
+        <button class="btn btn-outline" type="button" id="brevoDiagBtn">🔧 Run Brevo diagnostic</button>
+        <pre id="brevoDiagOut" style="display:none;margin-top:1rem;padding:1rem;background:var(--card-bg,#0d0d0d0a);border:1px solid var(--border);border-radius:8px;overflow:auto;max-height:400px;font-size:.8rem;white-space:pre-wrap;word-break:break-word"></pre>
+      </div>
+
+      <div class="form-section">
+        <h3>Audience overview <span style="font-weight:400;color:var(--muted);font-size:.9rem">(${totalActive} unique opted-in)</span></h3>
+        <div class="ov-grid">
+          ${audienceKeys.map(k => `<div class="ov-card">
+            <div class="n">${counts[k] ? counts[k].active : 0}</div>
+            <div class="l">${AUDIENCE_LABELS[k]}</div>
+          </div>`).join('')}
+        </div>
+      </div>
+
+      <form id="campaignForm" class="form-section">
+        <h3>Compose campaign</h3>
+        <div class="field"><label>Subject <span class="req">*</span></label>
+          <input name="subject" required placeholder="e.g. September 2026 impact update"></div>
+
+        <div class="field"><label>Body <span class="req">*</span></label>
+          <textarea name="body" required rows="10" placeholder="Write your update here. HTML is supported. Brevo will append the unsubscribe link automatically."></textarea>
+          <p style="color:var(--muted);font-size:.85rem;margin-top:.4rem">HTML supported. Keep it simple — line breaks, links, and basic formatting render best across email clients.</p>
+        </div>
+
+        <div class="field"><label>Audience <span class="req">*</span></label>
+          <div class="audience-picker" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.6rem;margin-top:.4rem">
+            ${audienceKeys.map(k => `<label style="display:flex;align-items:center;gap:.5rem;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;cursor:pointer">
+              <input type="checkbox" name="audience" value="${k}">
+              <span>${AUDIENCE_LABELS[k]}</span>
+              <span style="margin-left:auto;color:var(--muted);font-size:.85rem">${counts[k] ? counts[k].active : 0}</span>
+            </label>`).join('')}
+          </div>
+        </div>
+
+        <div class="fields-2">
+          <div class="field"><label>Send test to</label>
+            <input type="email" name="testEmail" placeholder="you@example.com — will send a test copy only"></div>
+          <div class="field"><label>Or schedule for</label>
+            <input type="datetime-local" name="scheduledAt"></div>
+        </div>
+
+        <div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-top:.6rem">
+          <button class="btn btn-outline" type="button" data-action="test">✉ Send test to me</button>
+          <button class="btn btn-outline" type="button" data-action="schedule">📅 Schedule</button>
+          <button class="btn btn-primary" type="button" data-action="send">📣 Send now</button>
+        </div>
+        <div class="form-msg" id="campaignMsg"></div>
+      </form>
+
+      <div class="form-section">
+        <h3>Send history</h3>
+        ${campaigns.length ? `<div class="tbl-wrap"><table class="tbl">
+          <thead><tr>
+            <th>Subject</th><th>Audience</th><th>Recipients</th><th>Status</th><th>When</th>
+          </tr></thead>
+          <tbody>${campaigns.map(c => `<tr>
+            <td class="strong">${esc(c.subject)}</td>
+            <td class="sub">${(c.audience || []).map(a => esc(a)).join(', ')}</td>
+            <td class="sub">${c.recipient_count == null ? '—' : c.recipient_count}</td>
+            <td><span class="status-dot ${esc(c.status)}"></span>${esc(c.status)}${c.error ? `<br><span class="sub" style="color:#b33">${esc(c.error)}</span>` : ''}</td>
+            <td class="sub">${fmtDate(c.sent_at || c.scheduled_at || c.created_at)}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>` : `<div class="empty-state">No campaigns sent yet.</div>`}
+      </div>
+    `;
+
+    const diagBtn = $('#brevoDiagBtn');
+    const diagOut = $('#brevoDiagOut');
+    if (diagBtn) diagBtn.addEventListener('click', async () => {
+      diagBtn.disabled = true;
+      diagOut.style.display = 'block';
+      diagOut.textContent = 'Running…';
+      try {
+        const r = await api('/api/admin/diagnostics/brevo');
+        diagOut.textContent = JSON.stringify(r, null, 2);
+      } catch (err) {
+        diagOut.textContent = 'Diagnostic failed: ' + err.message;
+      } finally {
+        diagBtn.disabled = false;
+      }
+    });
+
+    const form = $('#campaignForm');
+    const msg = $('#campaignMsg');
+    form.querySelectorAll('button[data-action]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const action = btn.dataset.action;
+        msg.className = 'form-msg';
+        msg.textContent = '';
+        const fd = new FormData(form);
+        const audience = fd.getAll('audience');
+        const payload = {
+          action,
+          subject: fd.get('subject'),
+          body: fd.get('body'),
+          audience,
+          testEmail: fd.get('testEmail'),
+          scheduledAt: fd.get('scheduledAt') || null
+        };
+        if (!payload.subject || !payload.body) {
+          msg.className = 'form-msg err'; msg.textContent = 'Subject and body are required.'; return;
+        }
+        if (action !== 'test' && !audience.length) {
+          msg.className = 'form-msg err'; msg.textContent = 'Pick at least one audience.'; return;
+        }
+        if (action === 'send' && !confirm(`Send "${payload.subject}" to ${audience.join(', ')} now?`)) return;
+        form.querySelectorAll('button').forEach(b => b.disabled = true);
+        try {
+          const r = await api('/api/admin/campaigns', { method: 'POST', json: payload });
+          msg.className = 'form-msg ok';
+          msg.textContent = action === 'test' ? 'Test email sent ✓'
+            : action === 'schedule' ? `Scheduled for ${new Date(r.scheduledAt).toLocaleString()} ✓`
+            : `Sent to ~${r.recipientCount} recipients ✓`;
+          if (action !== 'test') form.reset();
+          if (action !== 'test') setTimeout(renderCampaigns, 800);
+        } catch (err) {
+          msg.className = 'form-msg err'; msg.textContent = err.message;
+        } finally {
+          form.querySelectorAll('button').forEach(b => b.disabled = false);
+        }
+      });
     });
   }
 
