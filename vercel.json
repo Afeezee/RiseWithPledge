@@ -4,5 +4,11 @@
       "source": "/(.*)",
       "destination": "/api/index.js"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/birthdays",
+      "schedule": "0 7 * * *"
+    }
   ]
 }

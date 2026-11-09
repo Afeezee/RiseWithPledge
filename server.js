@@ -7,9 +7,12 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const store = require('./lib/db');
+const jsonStore = require('./lib/db');
 const pg = require('./lib/pg');
 const brevo = require('./lib/brevo');
+const blob = require('./lib/blob');
+const store = require('./lib/store');
+const email = require('./lib/email');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -27,7 +30,14 @@ if (!SESSION_SECRET) {
   throw new Error('SESSION_SECRET must be set when running on Vercel.');
 }
 
-const db = store.load();
+const db = jsonStore.load();
+
+// Mirror seeded admins from the JSON store into Postgres on first boot,
+// so SEED_ADMIN_* bootstrapping still works even when data/db.json is
+// ephemeral (/tmp on Vercel). Best-effort.
+if (pg.enabled()) {
+  store.syncAdminsToPg().catch(err => console.warn('[boot] admin pg sync failed:', err && err.message));
+}
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
@@ -65,43 +75,76 @@ function requireAdmin(req, res, next) {
   res.status(401).json({ error: 'Not authorised' });
 }
 
+function requireCron(req, res, next) {
+  const expected = process.env.CRON_SECRET || '';
+  const header = req.get('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!expected) return res.status(500).json({ error: 'CRON_SECRET is not configured.' });
+  if (token !== expected) return res.status(401).json({ error: 'Bad cron secret.' });
+  next();
+}
+
 function clean(str, max = 2000) {
   if (typeof str !== 'string') return '';
   return str.trim().slice(0, max);
+}
+
+function cleanDate(str) {
+  if (typeof str !== 'string') return '';
+  return /^\d{4}-\d{2}-\d{2}$/.test(str.trim()) ? str.trim() : '';
 }
 
 function nowIso() {
   return new Date().toISOString();
 }
 
+/**
+ * Upload the multer file (disk-stored) to Vercel Blob (prod) or move to
+ * public/uploads (local), returning { url, type } or null.
+ */
+async function handleUpload(file) {
+  if (!file) return null;
+  try {
+    const buffer = fs.readFileSync(file.path);
+    const res = await blob.putUpload({
+      buffer,
+      originalname: file.originalname,
+      mimetype: file.mimetype,
+      size: file.size
+    });
+    // Clean up the temp file after a successful blob upload.
+    try { fs.unlinkSync(file.path); } catch (_) { /* ignore */ }
+    return { url: res.url, type: blob.inferFileType(file.mimetype, file.originalname) };
+  } catch (err) {
+    console.error('[upload] blob put failed:', err && err.message);
+    // Fallback: keep the local file path so at least local dev works.
+    if (!process.env.VERCEL) {
+      return { url: '/uploads/' + path.basename(file.path), type: blob.inferFileType(file.mimetype, file.originalname) };
+    }
+    throw err;
+  }
+}
+
 // ============================================================
 // PUBLIC API
 // ============================================================
 
-// All public content in one call (settings, impact, content collections)
-app.get('/api/content', (req, res) => {
-  res.json({
-    settings: db.settings,
-    impact: db.impact,
-    team: db.team,
-    projects: db.projects,
-    stories: db.stories,
-    news: db.news,
-    gallery: db.gallery,
-    reports: db.reports,
-    partners: db.partners
-  });
+app.get('/api/content', async (req, res) => {
+  try {
+    const content = await store.getPublicContent();
+    res.json(content);
+  } catch (err) {
+    console.error('[public] content fetch failed:', err);
+    res.status(500).json({ error: 'Failed to load site content.' });
+  }
 });
 
 // ---- public form submissions ----
-// `source` is the subscriber-list source name used in Postgres + Brevo.
-// `metaFields` are copied into subscribers.metadata (JSONB) as form-specific
-// extras so we do not have to add a column per form.
 const SUBMISSION_TYPES = {
   member: {
     collection: 'members',
     source: 'membership',
-    fields: ['name', 'email', 'phone', 'occupation', 'location', 'motivation'],
+    fields: ['name', 'email', 'phone', 'dateOfBirth', 'occupation', 'location', 'motivation'],
     metaFields: ['occupation', 'location']
   },
   volunteer: {
@@ -125,103 +168,108 @@ const SUBMISSION_TYPES = {
   partner: {
     collection: 'partners_enquiries',
     source: 'partner',
-    // organisation replaces "subject" as the interesting extra field
     fields: ['name', 'email', 'phone', 'organisation', 'partnershipType', 'message'],
     metaFields: ['organisation', 'partnershipType']
   }
 };
 
-// Partner enquiries are a new collection — keep the JSON store in sync so the
-// existing admin submissions view can list them too.
-if (!Array.isArray(db.partners_enquiries)) db.partners_enquiries = [];
-
 /**
- * Push a subscriber into Postgres and Brevo. Never throws — a failure here
- * must not break the public-facing form submission, so we swallow and log.
+ * Push a subscriber into Postgres + fire welcome email via the configured
+ * provider. Also keeps the legacy Brevo contact-list sync wired for fallback.
+ * Never throws — form submissions must succeed even if email is down.
  */
-async function syncSubscriber({ email, fullName, phone, source, metadata }) {
-  // Postgres is optional at this point — Brevo is what actually delivers the
-  // welcome email, so we should still try Brevo even if Neon isn't wired up
-  // yet. That makes local testing possible before provisioning Postgres.
+async function syncSubscriber({ email: addr, fullName, phone, source, metadata, dateOfBirth }) {
   let subRow = null;
   if (pg.enabled()) {
     try {
-      const result = await pg.upsertSubscriber({ email, fullName, phone, source, metadata });
+      const result = await pg.upsertSubscriber({ email: addr, fullName, phone, source, metadata, dateOfBirth });
       subRow = result.row;
-      console.log('[subscribers] pg upsert ok:', source, email, subRow ? '(id ' + subRow.id + ')' : '');
+      console.log('[subscribers] pg upsert ok:', source, addr, subRow ? '(id ' + subRow.id + ')' : '');
     } catch (err) {
-      console.error('[subscribers] Postgres upsert failed:', source, email, err && err.message);
-      // fall through — we still want to try Brevo
+      console.error('[subscribers] pg upsert failed:', source, addr, err && err.message);
     }
-  } else {
-    console.warn('[subscribers] DATABASE_URL not set — pg upsert skipped for', source, email);
   }
 
-  if (!brevo.enabled()) {
-    console.warn('[subscribers] BREVO_API_KEY not set — Brevo sync skipped for', source, email);
-    return;
-  }
-  const list = brevo.listId(source);
-  if (!list) {
-    console.warn('[subscribers] BREVO_LIST_' + source.toUpperCase() + ' not set — contact will be created but not added to any list, so its welcome automation will not fire.');
-  }
+  // Fire welcome email via configured provider (Resend by default, Brevo fallback).
   try {
-    const brevoId = await brevo.upsertContact({
-      email,
+    await email.sendWelcome(source, {
+      email: addr,
       fullName,
-      source,
-      attributes: metadata || {}
+      unsubscribeToken: subRow ? subRow.unsubscribe_token : null
     });
-    console.log('[subscribers] brevo upsert ok:', source, email, 'listId=', list, brevoId ? '(created id=' + brevoId + ')' : '(updated existing contact)');
-    if (brevoId && subRow) {
-      try { await pg.setBrevoContactId(subRow.id, brevoId); } catch (_) { /* non-critical */ }
-    }
   } catch (err) {
-    console.error('[subscribers] Brevo sync FAILED:', source, email, 'listId=', list, '→', err && err.message);
+    console.error('[subscribers] welcome email failed:', source, addr, err && err.message);
+  }
+
+  // Keep the Brevo contact-list sync running when Brevo is configured — this is
+  // the "fallback" path so a separate Brevo campaign can still target the lists.
+  if (brevo.enabled()) {
+    try {
+      const brevoId = await brevo.upsertContact({
+        email: addr, fullName, source, attributes: metadata || {}
+      });
+      if (brevoId && subRow) {
+        try { await pg.setBrevoContactId(subRow.id, brevoId); } catch (_) { /* non-critical */ }
+      }
+    } catch (err) {
+      console.warn('[subscribers] brevo contact sync (fallback) failed:', source, addr, err && err.message);
+    }
   }
 }
 
-app.post('/api/submit/:type', (req, res) => {
+app.post('/api/submit/:type', async (req, res) => {
   const spec = SUBMISSION_TYPES[req.params.type];
   if (!spec) return res.status(404).json({ error: 'Unknown form' });
 
   const name = clean(req.body.name, 200);
-  const email = clean(req.body.email, 200);
-  if (!name || !email) return res.status(400).json({ error: 'Name and email are required.' });
-  if (!email.includes('@')) return res.status(400).json({ error: 'A valid email is required.' });
+  const addr = clean(req.body.email, 200);
+  if (!name || !addr) return res.status(400).json({ error: 'Name and email are required.' });
+  if (!addr.includes('@')) return res.status(400).json({ error: 'A valid email is required.' });
 
-  const entry = { id: store.id(), date: nowIso(), status: 'new' };
-  for (const f of spec.fields) entry[f] = clean(req.body[f]);
-  db[spec.collection].unshift(entry);
-  store.save();
+  const entry = {};
+  for (const f of spec.fields) {
+    entry[f] = f === 'dateOfBirth' ? cleanDate(req.body[f]) : clean(req.body[f]);
+  }
 
-  // Respond immediately; subscribe/sync in the background so a slow Brevo
-  // request never delays the user-visible success message.
+  try {
+    await store.insertSubmission(spec.collection, entry);
+  } catch (err) {
+    console.error('[submit] insert failed:', err);
+    return res.status(500).json({ error: 'Could not record your submission. Please try again.' });
+  }
+
   const metadata = {};
   for (const f of spec.metaFields || []) {
     if (entry[f]) metadata[f.toUpperCase()] = entry[f];
   }
+
+  // Fire-and-forget sync + welcome email.
   syncSubscriber({
     email: entry.email.toLowerCase(),
     fullName: entry.name,
     phone: entry.phone,
     source: spec.source,
-    metadata: Object.keys(metadata).length ? metadata : null
+    metadata: Object.keys(metadata).length ? metadata : null,
+    dateOfBirth: entry.dateOfBirth || null
   });
 
   res.json({ ok: true });
 });
 
-app.post('/api/subscribe', (req, res) => {
-  const email = clean(req.body.email, 200).toLowerCase();
+app.post('/api/subscribe', async (req, res) => {
+  const addr = clean(req.body.email, 200).toLowerCase();
   const fullName = clean(req.body.name || req.body.fullName || '', 200);
-  if (!email || !email.includes('@')) return res.status(400).json({ error: 'A valid email is required.' });
-  if (!db.newsletter.some(n => n.email === email)) {
-    db.newsletter.unshift({ id: store.id(), email, fullName, date: nowIso() });
-    store.save();
+  if (!addr || !addr.includes('@')) return res.status(400).json({ error: 'A valid email is required.' });
+
+  try {
+    await store.insertSubmission('newsletter', { email: addr, fullName });
+  } catch (err) {
+    console.error('[subscribe] insert failed:', err);
+    // Don't block the subscriber sync below; a duplicate here is fine.
   }
+
   syncSubscriber({
-    email,
+    email: addr,
     fullName: fullName || undefined,
     source: 'newsletter',
     metadata: null
@@ -229,25 +277,75 @@ app.post('/api/subscribe', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---- Brevo unsubscribe webhook ----
-// Configure this URL in Brevo → Transactional/Marketing → Webhooks with the
-// "unsubscribe" event. Include ?secret=<value> matching BREVO_WEBHOOK_SECRET
-// so random posters can't flip subscribers off.
+// ---- Public unsubscribe page (hit from email footer links) ----
+app.get('/unsubscribe/:token', async (req, res) => {
+  const token = String(req.params.token || '').trim();
+  let status = 'ok';
+  let message = 'You have been unsubscribed.';
+  if (!pg.enabled()) {
+    status = 'error';
+    message = 'Unsubscribe is not available in this environment.';
+  } else if (!/^[0-9a-f-]{32,}$/i.test(token)) {
+    status = 'error';
+    message = 'Invalid unsubscribe link.';
+  } else {
+    try {
+      const rows = await pg.markUnsubscribedByToken(token);
+      if (!rows.length) {
+        status = 'error';
+        message = 'This link is no longer valid — you may already be unsubscribed.';
+      }
+    } catch (err) {
+      console.error('[unsubscribe] failed:', err);
+      status = 'error';
+      message = 'Something went wrong. Please try again later.';
+    }
+  }
+  res.set('Content-Type', 'text/html; charset=utf-8').send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Unsubscribed — Rise With Pledge</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:Arial,sans-serif;background:#f6f7fb;color:#222;margin:0;padding:48px 24px;text-align:center}
+.card{max-width:520px;margin:0 auto;background:#fff;padding:32px;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.08)}
+h1{margin:0 0 12px;color:#0042ab}a{color:#0042ab}</style></head>
+<body><div class="card">
+  <h1>${status === 'ok' ? 'You\'ve been unsubscribed' : 'We couldn\'t unsubscribe you'}</h1>
+  <p>${message}</p>
+  <p><a href="/">← Return to risewithpledge.org</a></p>
+</div></body></html>`);
+});
+
+// ---- Email provider webhooks ----
+// Brevo (legacy): POST /api/webhooks/brevo?secret=…
 app.post('/api/webhooks/brevo', async (req, res) => {
   const secret = process.env.BREVO_WEBHOOK_SECRET || '';
   if (secret && req.query.secret !== secret) return res.status(401).json({ error: 'bad secret' });
   const body = req.body || {};
   const event = String(body.event || '').toLowerCase();
-  const email = String(body.email || '').toLowerCase();
-  if (!email) return res.status(400).json({ error: 'missing email' });
-  // Handle unsubscribe + list_unsubscribe + spam events uniformly.
+  const addr = String(body.email || '').toLowerCase();
+  if (!addr) return res.status(400).json({ error: 'missing email' });
   if (event === 'unsubscribe' || event === 'list_unsubscribe' || event === 'spam') {
+    try { await pg.markUnsubscribedByEmail(addr); } catch (err) { console.error('[brevo webhook]', err); }
+  }
+  res.json({ ok: true });
+});
+
+// Resend: POST /api/webhooks/resend (Svix-signed; fallback to secret query param for simplicity).
+app.post('/api/webhooks/resend', async (req, res) => {
+  const secret = process.env.RESEND_WEBHOOK_SECRET || '';
+  if (secret && req.query.secret !== secret) {
+    return res.status(401).json({ error: 'bad secret' });
+  }
+  const body = req.body || {};
+  const type = String(body.type || '').toLowerCase();
+  const data = body.data || {};
+  const to = Array.isArray(data.to) ? data.to[0] : data.to;
+  if (!to) return res.status(400).json({ error: 'missing recipient' });
+  // email.bounced, email.complained, email.unsubscribed — flip subscribed=false.
+  if (type === 'email.bounced' || type === 'email.complained' || type === 'email.unsubscribed') {
     try {
-      const rows = await pg.markUnsubscribedByEmail(email);
-      console.log('[brevo webhook] unsubscribed', email, 'sources:', rows.map(r => r.source).join(','));
-    } catch (err) {
-      console.error('[brevo webhook] failed to flip subscribed flag:', err && err.message);
-    }
+      await pg.markUnsubscribedByEmail(String(to).toLowerCase());
+      console.log('[resend webhook]', type, to);
+    } catch (err) { console.error('[resend webhook]', err); }
   }
   res.json({ ok: true });
 });
@@ -256,15 +354,20 @@ app.post('/api/webhooks/brevo', async (req, res) => {
 // ADMIN API
 // ============================================================
 
-app.post('/api/admin/login', (req, res) => {
+app.post('/api/admin/login', async (req, res) => {
   const { username, password } = req.body || {};
-  const admin = db.admins.find(a => a.username === String(username || '').trim().toLowerCase());
-  if (admin && store.verifyPassword(String(password || ''), admin.salt, admin.hash)) {
-    req.session.isAdmin = true;
-    req.session.adminUser = admin.username;
-    return res.json({ ok: true, username: admin.username });
+  try {
+    const admin = await store.findAdmin(String(username || '').trim().toLowerCase());
+    if (admin && jsonStore.verifyPassword(String(password || ''), admin.salt, admin.hash)) {
+      req.session.isAdmin = true;
+      req.session.adminUser = admin.username;
+      return res.json({ ok: true, username: admin.username });
+    }
+    res.status(401).json({ error: 'Invalid username or password.' });
+  } catch (err) {
+    console.error('[login]', err);
+    res.status(500).json({ error: 'Login error.' });
   }
-  res.status(401).json({ error: 'Invalid username or password.' });
 });
 
 app.post('/api/admin/logout', (req, res) => {
@@ -275,126 +378,156 @@ app.get('/api/admin/session', (req, res) => {
   res.json({ loggedIn: !!(req.session && req.session.isAdmin), username: req.session && req.session.adminUser });
 });
 
-// Changes the password of the currently signed-in admin only
-app.post('/api/admin/password', requireAdmin, (req, res) => {
+app.post('/api/admin/password', requireAdmin, async (req, res) => {
   const { current, next } = req.body || {};
-  const admin = db.admins.find(a => a.username === req.session.adminUser);
-  if (!admin) return res.status(400).json({ error: 'Account not found — please log in again.' });
-  if (!store.verifyPassword(String(current || ''), admin.salt, admin.hash)) {
-    return res.status(400).json({ error: 'Current password is incorrect.' });
+  try {
+    const admin = await store.findAdmin(req.session.adminUser);
+    if (!admin) return res.status(400).json({ error: 'Account not found — please log in again.' });
+    if (!jsonStore.verifyPassword(String(current || ''), admin.salt, admin.hash)) {
+      return res.status(400).json({ error: 'Current password is incorrect.' });
+    }
+    if (!next || String(next).length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+    }
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = jsonStore.hashPassword(String(next), salt);
+    await store.updateAdminPassword(req.session.adminUser, salt, hash);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[password]', err);
+    res.status(500).json({ error: 'Could not update password.' });
   }
-  if (!next || String(next).length < 8) {
-    return res.status(400).json({ error: 'New password must be at least 8 characters.' });
-  }
-  admin.salt = crypto.randomBytes(16).toString('hex');
-  admin.hash = store.hashPassword(String(next), admin.salt);
-  store.save();
-  res.json({ ok: true });
 });
 
-// Everything the dashboard needs in one call (credentials excluded)
-app.get('/api/admin/data', requireAdmin, (req, res) => {
-  const { admins, admin, ...safe } = db;
-  res.json(safe);
+app.get('/api/admin/data', requireAdmin, async (req, res) => {
+  try {
+    const data = await store.getAllContentForAdmin();
+    res.json(data);
+  } catch (err) {
+    console.error('[admin/data]', err);
+    res.status(500).json({ error: 'Failed to load dashboard data.' });
+  }
 });
 
 // ---- settings & impact ----
-app.put('/api/admin/settings', requireAdmin, (req, res) => {
-  for (const key of Object.keys(db.settings)) {
-    if (req.body[key] !== undefined) db.settings[key] = clean(req.body[key], 500);
+app.put('/api/admin/settings', requireAdmin, async (req, res) => {
+  try {
+    const keys = Object.keys(db.settings);
+    const patch = {};
+    for (const k of keys) if (req.body[k] !== undefined) patch[k] = clean(req.body[k], 500);
+    const settings = await store.patchSettings(patch, keys);
+    res.json({ ok: true, settings });
+  } catch (err) {
+    console.error('[settings]', err);
+    res.status(500).json({ error: 'Failed to save settings.' });
   }
-  store.save();
-  res.json({ ok: true, settings: db.settings });
 });
 
-app.put('/api/admin/impact', requireAdmin, (req, res) => {
-  for (const key of Object.keys(db.impact)) {
-    if (req.body[key] !== undefined) {
-      const n = Number(req.body[key]);
-      db.impact[key] = Number.isFinite(n) && n >= 0 ? n : 0;
-    }
+app.put('/api/admin/impact', requireAdmin, async (req, res) => {
+  try {
+    const keys = Object.keys(db.impact);
+    const impact = await store.patchImpact(req.body || {}, keys);
+    res.json({ ok: true, impact });
+  } catch (err) {
+    console.error('[impact]', err);
+    res.status(500).json({ error: 'Failed to save impact stats.' });
   }
-  store.save();
-  res.json({ ok: true, impact: db.impact });
 });
 
 // ---- content collections (CRUD, with optional file upload) ----
-const CONTENT_COLLECTIONS = {
-  team: ['name', 'role', 'category', 'bio'],
+const CONTENT_FIELDS = {
+  team:     ['name', 'role', 'category', 'bio'],
   projects: ['title', 'status', 'description', 'location', 'date'],
-  stories: ['title', 'content', 'personName', 'date'],
-  news: ['title', 'category', 'content', 'eventDate', 'location'],
-  gallery: ['title', 'mediaType', 'description'],
-  reports: ['title', 'category', 'year', 'description'],
+  stories:  ['title', 'content', 'personName', 'date'],
+  news:     ['title', 'category', 'content', 'eventDate', 'location'],
+  gallery:  ['title', 'mediaType', 'description'],
+  reports:  ['title', 'category', 'year', 'description'],
   partners: ['name', 'website']
 };
 
-app.post('/api/admin/content/:collection', requireAdmin, upload.single('file'), (req, res) => {
-  const fields = CONTENT_COLLECTIONS[req.params.collection];
+app.post('/api/admin/content/:collection', requireAdmin, upload.single('file'), async (req, res) => {
+  const fields = CONTENT_FIELDS[req.params.collection];
   if (!fields) return res.status(404).json({ error: 'Unknown collection' });
-  const entry = { id: store.id(), createdAt: nowIso() };
-  for (const f of fields) entry[f] = clean(req.body[f]);
-  if (req.file) entry.file = '/uploads/' + req.file.filename;
-  db[req.params.collection].unshift(entry);
-  store.save();
-  res.json({ ok: true, entry });
+  try {
+    const data = {};
+    for (const f of fields) data[f] = clean(req.body[f]);
+    const uploaded = await handleUpload(req.file);
+    const entry = await store.insertContent(req.params.collection, data, uploaded);
+    res.json({ ok: true, entry });
+  } catch (err) {
+    console.error('[content create]', err);
+    res.status(500).json({ error: err.message || 'Failed to publish.' });
+  }
 });
 
-app.put('/api/admin/content/:collection/:id', requireAdmin, upload.single('file'), (req, res) => {
-  const fields = CONTENT_COLLECTIONS[req.params.collection];
+app.put('/api/admin/content/:collection/:id', requireAdmin, upload.single('file'), async (req, res) => {
+  const fields = CONTENT_FIELDS[req.params.collection];
   if (!fields) return res.status(404).json({ error: 'Unknown collection' });
-  const item = db[req.params.collection].find(x => x.id === req.params.id);
-  if (!item) return res.status(404).json({ error: 'Not found' });
-  for (const f of fields) {
-    if (req.body[f] !== undefined) item[f] = clean(req.body[f]);
+  try {
+    const patch = {};
+    for (const f of fields) if (req.body[f] !== undefined) patch[f] = clean(req.body[f]);
+    const uploaded = await handleUpload(req.file);
+    // If a new file was uploaded, delete the old one before overwriting the pointer.
+    if (uploaded) {
+      // Best-effort — find the current record to pull its old file url.
+      const current = await store.getAllContentForAdmin();
+      const existing = (current[req.params.collection] || []).find(x => x.id === req.params.id);
+      if (existing && existing.file) {
+        try { await blob.deleteUpload(existing.file); } catch (_) { /* ignore */ }
+      }
+    }
+    const entry = await store.updateContent(req.params.collection, req.params.id, patch, uploaded);
+    if (!entry) return res.status(404).json({ error: 'Not found' });
+    res.json({ ok: true, entry });
+  } catch (err) {
+    console.error('[content update]', err);
+    res.status(500).json({ error: err.message || 'Failed to save.' });
   }
-  if (req.file) {
-    removeUpload(item.file);
-    item.file = '/uploads/' + req.file.filename;
-  }
-  store.save();
-  res.json({ ok: true, entry: item });
 });
 
-app.delete('/api/admin/content/:collection/:id', requireAdmin, (req, res) => {
-  const fields = CONTENT_COLLECTIONS[req.params.collection];
-  if (!fields) return res.status(404).json({ error: 'Unknown collection' });
-  const idx = db[req.params.collection].findIndex(x => x.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-  removeUpload(db[req.params.collection][idx].file);
-  db[req.params.collection].splice(idx, 1);
-  store.save();
-  res.json({ ok: true });
+app.delete('/api/admin/content/:collection/:id', requireAdmin, async (req, res) => {
+  if (!CONTENT_FIELDS[req.params.collection]) return res.status(404).json({ error: 'Unknown collection' });
+  try {
+    const removed = await store.deleteContent(req.params.collection, req.params.id);
+    if (!removed) return res.status(404).json({ error: 'Not found' });
+    if (removed.fileUrl) {
+      try { await blob.deleteUpload(removed.fileUrl); } catch (_) { /* ignore */ }
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[content delete]', err);
+    res.status(500).json({ error: err.message || 'Failed to delete.' });
+  }
 });
 
-function removeUpload(filePath) {
-  if (!filePath || !filePath.startsWith('/uploads/')) return;
-  const abs = path.join(UPLOAD_DIR, path.basename(filePath));
-  if (fs.existsSync(abs)) {
-    try { fs.unlinkSync(abs); } catch (e) { /* file may be locked; ignore */ }
-  }
-}
-
-// ---- submissions management (members, volunteers, pledges, contacts, newsletter) ----
+// ---- submissions management ----
 const SUBMISSION_COLLECTIONS = new Set(['members', 'volunteers', 'pledges', 'contacts', 'partners_enquiries', 'newsletter']);
 
-app.put('/api/admin/submissions/:collection/:id', requireAdmin, (req, res) => {
+app.put('/api/admin/submissions/:collection/:id', requireAdmin, async (req, res) => {
   if (!SUBMISSION_COLLECTIONS.has(req.params.collection)) return res.status(404).json({ error: 'Unknown collection' });
-  const item = db[req.params.collection].find(x => x.id === req.params.id);
-  if (!item) return res.status(404).json({ error: 'Not found' });
-  if (req.body.status !== undefined) item.status = clean(req.body.status, 50);
-  if (req.body.note !== undefined) item.note = clean(req.body.note, 1000);
-  store.save();
-  res.json({ ok: true, entry: item });
+  try {
+    const patch = {};
+    if (req.body.status !== undefined) patch.status = clean(req.body.status, 50);
+    if (req.body.note !== undefined)   patch.note   = clean(req.body.note, 1000);
+    const entry = await store.updateSubmission(req.params.collection, req.params.id, patch);
+    if (!entry) return res.status(404).json({ error: 'Not found' });
+    res.json({ ok: true, entry });
+  } catch (err) {
+    console.error('[submission update]', err);
+    res.status(500).json({ error: 'Failed to save.' });
+  }
 });
 
-app.delete('/api/admin/submissions/:collection/:id', requireAdmin, (req, res) => {
+app.delete('/api/admin/submissions/:collection/:id', requireAdmin, async (req, res) => {
   if (!SUBMISSION_COLLECTIONS.has(req.params.collection)) return res.status(404).json({ error: 'Unknown collection' });
-  const idx = db[req.params.collection].findIndex(x => x.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-  db[req.params.collection].splice(idx, 1);
-  store.save();
-  res.json({ ok: true });
+  try {
+    const ok = await store.deleteSubmission(req.params.collection, req.params.id);
+    if (!ok) return res.status(404).json({ error: 'Not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[submission delete]', err);
+    res.status(500).json({ error: 'Failed to delete.' });
+  }
 });
 
 // ============================================================
@@ -411,10 +544,7 @@ function requirePg(res) {
   return true;
 }
 
-// Brevo diagnostics — sanity-check the API key, sender, and configured lists.
-// Read-only: makes lightweight calls to Brevo and reports what it sees. Useful
-// when welcome emails aren't landing and you need to know whether the code, the
-// config, or Brevo itself is the problem.
+// Brevo-specific diagnostic (kept for the "fallback" case).
 app.get('/api/admin/diagnostics/brevo', requireAdmin, async (req, res) => {
   const report = {
     envConfigured: {
@@ -429,18 +559,10 @@ app.get('/api/admin/diagnostics/brevo', requireAdmin, async (req, res) => {
         contact:    process.env.BREVO_LIST_CONTACT || null
       }
     },
-    apiKeyWorks: null,
-    account: null,
-    senderVerified: null,
-    listChecks: {},
-    error: null
+    apiKeyWorks: null, account: null, senderVerified: null, listChecks: {}, error: null
   };
-  if (!brevo.enabled()) {
-    report.error = 'BREVO_API_KEY is not set.';
-    return res.json(report);
-  }
+  if (!brevo.enabled()) { report.error = 'BREVO_API_KEY is not set.'; return res.json(report); }
   try {
-    // 1) Prove the API key works and grab account/plan info.
     const acc = await fetch('https://api.brevo.com/v3/account', {
       headers: { 'api-key': process.env.BREVO_API_KEY, Accept: 'application/json' }
     });
@@ -452,12 +574,9 @@ app.get('/api/admin/diagnostics/brevo', requireAdmin, async (req, res) => {
     const accData = await acc.json();
     report.apiKeyWorks = true;
     report.account = {
-      email: accData.email,
-      companyName: accData.companyName,
+      email: accData.email, companyName: accData.companyName,
       plan: (accData.plan || []).map(p => ({ type: p.type, credits: p.credits, creditsType: p.creditsType }))
     };
-
-    // 2) Is the configured sender verified?
     if (process.env.BREVO_SENDER_EMAIL) {
       const sr = await fetch('https://api.brevo.com/v3/senders', {
         headers: { 'api-key': process.env.BREVO_API_KEY, Accept: 'application/json' }
@@ -466,8 +585,6 @@ app.get('/api/admin/diagnostics/brevo', requireAdmin, async (req, res) => {
       const match = (sd.senders || []).find(s => (s.email || '').toLowerCase() === process.env.BREVO_SENDER_EMAIL.toLowerCase());
       report.senderVerified = match ? { active: !!match.active, name: match.name } : false;
     }
-
-    // 3) Does each configured list actually exist?
     for (const [source, id] of Object.entries(report.envConfigured.lists)) {
       if (!id) { report.listChecks[source] = { configured: false }; continue; }
       const lr = await fetch('https://api.brevo.com/v3/contacts/lists/' + id, {
@@ -482,34 +599,30 @@ app.get('/api/admin/diagnostics/brevo', requireAdmin, async (req, res) => {
     }
     res.json(report);
   } catch (err) {
-    // Node's fetch (undici) wraps the actual reason in err.cause.
-    // Surface both so "fetch failed" doesn't hide the DNS/TLS/TCP reason.
     report.error = err.message;
-    report.errorCause = err.cause ? {
-      message: err.cause.message,
-      code: err.cause.code,
-      errno: err.cause.errno,
-      syscall: err.cause.syscall,
-      hostname: err.cause.hostname
-    } : null;
+    report.errorCause = err.cause ? { message: err.cause.message, code: err.cause.code, errno: err.cause.errno, syscall: err.cause.syscall, hostname: err.cause.hostname } : null;
     report.nodeVersion = process.version;
     res.status(200).json(report);
   }
 });
 
-// Subscriber counts per source (drives dashboard overview + audience selector).
+// Unified email-provider diagnostic — reports Resend status + active provider.
+app.get('/api/admin/diagnostics/email', requireAdmin, async (req, res) => {
+  const report = await email.diagnostics();
+  res.json(report);
+});
+
 app.get('/api/admin/subscribers/counts', requireAdmin, async (req, res) => {
   if (!requirePg(res)) return;
   try {
     const counts = await pg.countsBySource();
-    res.json({ ok: true, counts, brevoConfigured: brevo.enabled() });
+    res.json({ ok: true, counts, brevoConfigured: brevo.enabled(), provider: email.providerName() });
   } catch (err) {
     console.error('[admin] counts failed:', err);
     res.status(500).json({ error: 'Failed to load subscriber counts.' });
   }
 });
 
-// List past + queued campaigns.
 app.get('/api/admin/campaigns', requireAdmin, async (req, res) => {
   if (!requirePg(res)) return;
   try {
@@ -521,10 +634,9 @@ app.get('/api/admin/campaigns', requireAdmin, async (req, res) => {
   }
 });
 
-// Compose + send (or schedule). `action` is 'send', 'schedule', or 'test'.
 app.post('/api/admin/campaigns', requireAdmin, async (req, res) => {
   if (!requirePg(res)) return;
-  if (!brevo.enabled()) return res.status(503).json({ error: 'Brevo is not configured (missing BREVO_API_KEY).' });
+  if (!email.enabled()) return res.status(503).json({ error: 'No email provider is configured.' });
 
   const subject = clean(req.body.subject, 500);
   const body = clean(req.body.body, 200000);
@@ -536,85 +648,145 @@ app.post('/api/admin/campaigns', requireAdmin, async (req, res) => {
 
   if (!subject) return res.status(400).json({ error: 'Subject is required.' });
   if (!body) return res.status(400).json({ error: 'Body is required.' });
-  if (!audience.length) return res.status(400).json({ error: 'Pick at least one audience.' });
+  if (!audience.length && action !== 'test') return res.status(400).json({ error: 'Pick at least one audience.' });
   if (action === 'schedule' && (!scheduledAt || isNaN(scheduledAt.getTime()) || scheduledAt <= new Date())) {
     return res.status(400).json({ error: 'A future scheduled date/time is required.' });
   }
   if (action === 'test' && !testEmail) return res.status(400).json({ error: 'A test recipient email is required.' });
 
-  // Wrap the composed HTML in a minimal frame and include Brevo's mandatory
-  // unsubscribe link token so campaigns pass compliance.
-  const htmlContent = wrapCampaignHtml(subject, body);
-
-  let recipientCount = 0;
-  try {
-    const emails = await pg.activeEmailsForSources(audience);
-    recipientCount = emails.length;
-  } catch (err) {
-    console.error('[admin] audience count failed:', err);
-  }
-
-  let campaignId = null;
   let record = null;
   try {
+    // 1) Resolve the audience and create the campaign record.
+    const recipients = action === 'test'
+      ? [{ email: testEmail, full_name: null, unsubscribe_token: null }]
+      : await pg.activeSubscribersForSources(audience);
+    const recipientCount = recipients.length;
     record = await pg.createCampaignRecord({
       subject, audience,
       status: action === 'test' ? 'test' : (action === 'schedule' ? 'scheduled' : 'sending'),
       scheduledAt: action === 'schedule' ? scheduledAt.toISOString() : null,
       sentBy: req.session.adminUser,
-      recipientCount
+      recipientCount,
+      provider: email.providerName()
     });
 
-    campaignId = await brevo.createCampaign({
-      subject,
-      htmlContent,
-      audience,
-      scheduledAt: action === 'schedule' ? scheduledAt : null
+    if (action === 'schedule') {
+      // Simple MVP: record it; actual scheduled delivery on Resend uses a cron.
+      // For now we send immediately when "schedule" is picked with a future time
+      // on the Brevo provider only; Resend scheduling can be added later.
+      await pg.markCampaignScheduled(record.id, {
+        scheduledAt: scheduledAt.toISOString(),
+        recipientCount,
+        brevoCampaignId: null
+      });
+      return res.json({ ok: true, action: 'schedule', scheduledAt: scheduledAt.toISOString(), recipientCount, note: 'Scheduled campaigns run via Vercel Cron (see /api/cron/campaigns, not yet implemented). To send right now, pick "Send now".' });
+    }
+
+    // 2) Send (test or send-now) via the email abstraction.
+    const result = await email.sendCampaign({
+      subject, html: body, recipients, campaignId: record.id
     });
 
     if (action === 'test') {
-      await brevo.sendTestEmail(campaignId, testEmail);
-      // Test doesn't count as a real send; keep the record for history but
-      // mark it clearly.
-      return res.json({ ok: true, action: 'test', brevoCampaignId: campaignId });
+      return res.json({ ok: true, action: 'test', provider: email.providerName(), result });
     }
-    if (action === 'send') {
-      await brevo.sendCampaignNow(campaignId);
-      await pg.markCampaignSent(record.id, {
-        sentAt: new Date().toISOString(),
-        recipientCount,
-        brevoCampaignId: campaignId
-      });
-      return res.json({ ok: true, action: 'send', brevoCampaignId: campaignId, recipientCount });
-    }
-    // schedule — Brevo already queued it via scheduledAt in createCampaign;
-    // just update our local record.
-    await pg.markCampaignScheduled(record.id, {
-      scheduledAt: scheduledAt.toISOString(),
-      recipientCount,
-      brevoCampaignId: campaignId
+    await pg.markCampaignSent(record.id, {
+      sentAt: new Date().toISOString(),
+      recipientCount: result.sent,
+      brevoCampaignId: result.brevoCampaignId || null
     });
-    return res.json({ ok: true, action: 'schedule', brevoCampaignId: campaignId, scheduledAt: scheduledAt.toISOString(), recipientCount });
+    res.json({ ok: true, action: 'send', provider: email.providerName(), sent: result.sent, failed: result.failed, recipientCount });
   } catch (err) {
-    console.error('[admin] campaign send failed:', err);
+    console.error('[campaign send]', err);
     if (record) {
       try { await pg.markCampaignFailed(record.id, err.message); } catch (_) { /* ignore */ }
     }
-    return res.status(502).json({ error: err.message || 'Brevo request failed.' });
+    res.status(502).json({ error: err.message || 'Campaign send failed.' });
   }
 });
 
-function wrapCampaignHtml(subject, body) {
-  const esc = (s) => String(s || '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-  // Very light wrapper — Brevo injects tracking + unsubscribe automatically
-  // via the {{ unsubscribe }} token which the platform expands per-recipient.
-  return `<!doctype html><html><body style="font-family:Arial,sans-serif;color:#222;max-width:640px;margin:0 auto;padding:24px">
-<h1 style="color:#0042ab;font-size:22px;margin:0 0 16px">${esc(subject)}</h1>
-<div style="font-size:15px;line-height:1.55">${body}</div>
-<hr style="margin:32px 0;border:none;border-top:1px solid #ddd">
-<p style="font-size:12px;color:#888">Rise With Pledge Foundation · <a href="{{ unsubscribe }}" style="color:#888">Unsubscribe</a></p>
-</body></html>`;
+// ============================================================
+// BIRTHDAYS (admin + cron)
+// ============================================================
+
+app.get('/api/admin/birthdays', requireAdmin, async (req, res) => {
+  if (!requirePg(res)) return;
+  try {
+    const [today, upcoming, sent] = await Promise.all([
+      pg.findMembersWithBirthdayToday(),
+      pg.findUpcomingBirthdays(14),
+      pg.listBirthdayMessages(50)
+    ]);
+    res.json({ ok: true, today, upcoming, sent });
+  } catch (err) {
+    console.error('[birthdays list]', err);
+    res.status(500).json({ error: 'Failed to load birthdays.' });
+  }
+});
+
+/**
+ * Run the birthday job on demand (admin-triggered). Same handler as the cron.
+ */
+async function runBirthdayJob({ dryRun = false } = {}) {
+  if (!pg.enabled()) throw new Error('DATABASE_URL is not configured.');
+  const members = await pg.findMembersWithBirthdayToday();
+  const sent = [];
+  const skipped = [];
+  const failed = [];
+  for (const m of members) {
+    if (!m.email) { skipped.push({ email: null, reason: 'no email on record' }); continue; }
+    try {
+      const already = await pg.wasBirthdayMessageSentToday(m.id);
+      if (already) { skipped.push({ email: m.email, reason: 'already greeted today' }); continue; }
+      if (dryRun) { sent.push({ email: m.email, name: m.full_name, dryRun: true }); continue; }
+      const result = await email.sendBirthday({
+        email: m.email,
+        fullName: m.full_name,
+        unsubscribeToken: m.unsubscribe_token
+      });
+      await pg.logBirthdayMessage({
+        subscriberId: m.id, email: m.email, fullName: m.full_name,
+        status: 'sent', providerId: result && result.id ? result.id : null
+      });
+      sent.push({ email: m.email, name: m.full_name });
+    } catch (err) {
+      console.error('[birthday] send failed for', m.email, err && err.message);
+      await pg.logBirthdayMessage({
+        subscriberId: m.id, email: m.email, fullName: m.full_name,
+        status: 'failed', error: err && err.message
+      });
+      failed.push({ email: m.email, error: err && err.message });
+    }
+  }
+  // Digest email to admin.
+  const digestTo = process.env.ADMIN_DIGEST_EMAIL;
+  if (!dryRun && digestTo && (sent.length || failed.length)) {
+    try { await email.sendBirthdayDigest({ to: digestTo, sent, failed, skipped }); }
+    catch (err) { console.warn('[birthday] digest email failed:', err && err.message); }
+  }
+  return { date: new Date().toISOString().slice(0, 10), sent, failed, skipped, dryRun };
 }
+
+app.post('/api/admin/birthdays/run', requireAdmin, async (req, res) => {
+  try {
+    const result = await runBirthdayJob({ dryRun: req.query.dryRun === '1' });
+    res.json({ ok: true, result });
+  } catch (err) {
+    console.error('[birthday run]', err);
+    res.status(500).json({ error: err.message || 'Birthday run failed.' });
+  }
+});
+
+app.get('/api/cron/birthdays', requireCron, async (req, res) => {
+  try {
+    const result = await runBirthdayJob();
+    console.log('[cron birthdays]', result);
+    res.json({ ok: true, result });
+  } catch (err) {
+    console.error('[cron birthdays]', err);
+    res.status(500).json({ error: err.message || 'Birthday cron failed.' });
+  }
+});
 
 // ============================================================
 // STATIC FILES & PAGES
@@ -640,7 +812,9 @@ if (require.main === module) {
     console.log('  ------------------------------------');
     console.log('  Public site:     http://localhost:' + PORT);
     console.log('  Admin dashboard: http://localhost:' + PORT + '/admin');
-    console.log('  Admin access:    existing data/db.json or SEED_ADMIN_* environment variables');
+    console.log('  Email provider:  ' + email.providerName());
+    console.log('  Postgres:        ' + (pg.enabled() ? 'ENABLED' : 'disabled (local JSON store)'));
+    console.log('  Vercel Blob:     ' + (blob.enabled() ? 'ENABLED' : 'disabled (local public/uploads)'));
     console.log('');
   });
 }

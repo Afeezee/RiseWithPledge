@@ -183,6 +183,7 @@
     document.body.classList.remove('side-open');
     if (view === 'overview') return renderOverview();
     if (view === 'campaigns') return renderCampaigns();
+    if (view === 'birthdays') return renderBirthdays();
     if (SUBMISSION_VIEWS[view]) return renderSubmissions(view);
     if (CONTENT_VIEWS[view]) return renderContent(view);
     if (view === 'impact') return renderImpact();
@@ -554,9 +555,13 @@
       </div>` : ''}
 
       <div class="form-section">
-        <h3>Brevo diagnostics</h3>
-        <p style="color:var(--muted);font-size:.9rem">Runs a read-only check against Brevo — confirms the API key, sender verification, and every configured list id. Use this when welcome emails aren't landing.</p>
-        <button class="btn btn-outline" type="button" id="brevoDiagBtn">🔧 Run Brevo diagnostic</button>
+        <h3>Email provider diagnostics</h3>
+        <p style="color:var(--muted);font-size:.9rem">Runs a read-only check against your configured email providers. Reports the active provider, Resend domain verification, and (if enabled) Brevo account status.</p>
+        <div style="display:flex;gap:.6rem;flex-wrap:wrap">
+          <button class="btn btn-outline" type="button" id="emailDiagBtn">🔧 Run email diagnostic</button>
+          <button class="btn btn-outline" type="button" id="brevoDiagBtn">🔧 Run Brevo diagnostic (fallback)</button>
+        </div>
+        <pre id="emailDiagOut" style="display:none;margin-top:1rem;padding:1rem;background:var(--card-bg,#0d0d0d0a);border:1px solid var(--border);border-radius:8px;overflow:auto;max-height:400px;font-size:.8rem;white-space:pre-wrap;word-break:break-word"></pre>
         <pre id="brevoDiagOut" style="display:none;margin-top:1rem;padding:1rem;background:var(--card-bg,#0d0d0d0a);border:1px solid var(--border);border-radius:8px;overflow:auto;max-height:400px;font-size:.8rem;white-space:pre-wrap;word-break:break-word"></pre>
       </div>
 
@@ -622,21 +627,25 @@
       </div>
     `;
 
-    const diagBtn = $('#brevoDiagBtn');
-    const diagOut = $('#brevoDiagOut');
-    if (diagBtn) diagBtn.addEventListener('click', async () => {
-      diagBtn.disabled = true;
-      diagOut.style.display = 'block';
-      diagOut.textContent = 'Running…';
-      try {
-        const r = await api('/api/admin/diagnostics/brevo');
-        diagOut.textContent = JSON.stringify(r, null, 2);
-      } catch (err) {
-        diagOut.textContent = 'Diagnostic failed: ' + err.message;
-      } finally {
-        diagBtn.disabled = false;
-      }
-    });
+    function wireDiag(btnId, outId, url) {
+      const b = $(btnId), o = $(outId);
+      if (!b || !o) return;
+      b.addEventListener('click', async () => {
+        b.disabled = true;
+        o.style.display = 'block';
+        o.textContent = 'Running…';
+        try {
+          const r = await api(url);
+          o.textContent = JSON.stringify(r, null, 2);
+        } catch (err) {
+          o.textContent = 'Diagnostic failed: ' + err.message;
+        } finally {
+          b.disabled = false;
+        }
+      });
+    }
+    wireDiag('#emailDiagBtn', '#emailDiagOut', '/api/admin/diagnostics/email');
+    wireDiag('#brevoDiagBtn', '#brevoDiagOut', '/api/admin/diagnostics/brevo');
 
     const form = $('#campaignForm');
     const msg = $('#campaignMsg');
@@ -678,6 +687,94 @@
         }
       });
     });
+  }
+
+  // ---------------- birthdays ----------------
+  async function renderBirthdays() {
+    $('#viewTitle').textContent = 'Birthdays';
+    wrap().innerHTML = `<div class="empty-state">Loading birthdays…</div>`;
+    let data = null;
+    try {
+      data = await api('/api/admin/birthdays');
+    } catch (err) {
+      wrap().innerHTML = `<div class="empty-state" style="color:#b33">Could not load birthdays — ${esc(err.message)}.</div>`;
+      return;
+    }
+    const today = data.today || [];
+    const upcoming = data.upcoming || [];
+    const sent = data.sent || [];
+    const todayStr = new Date().toLocaleDateString('en-NG', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+
+    wrap().innerHTML = `
+      <div class="view-head">
+        <p>Birthday greetings go out automatically every morning via Vercel Cron. You can also trigger a run manually with the buttons below.</p>
+      </div>
+
+      <div class="form-section">
+        <h3>🎂 Today — ${esc(todayStr)} <span style="color:var(--muted);font-weight:400">(${today.length})</span></h3>
+        ${today.length ? `<div class="tbl-wrap"><table class="tbl">
+          <thead><tr><th>Name</th><th>Email</th><th>Date of Birth</th></tr></thead>
+          <tbody>${today.map(m => `<tr>
+            <td class="strong">${esc(m.full_name || '—')}</td>
+            <td class="sub">${esc(m.email)}</td>
+            <td class="sub">${esc(m.date_of_birth || '')}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>` : `<div class="empty-state">No birthdays today.</div>`}
+        <div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1rem">
+          <button class="btn btn-outline" type="button" id="brDryRun">🧪 Dry run</button>
+          <button class="btn btn-primary" type="button" id="brRun">📬 Send greetings now</button>
+        </div>
+        <div class="form-msg" id="brMsg"></div>
+      </div>
+
+      <div class="form-section">
+        <h3>Upcoming (next 14 days) <span style="color:var(--muted);font-weight:400">(${upcoming.length})</span></h3>
+        ${upcoming.length ? `<div class="tbl-wrap"><table class="tbl">
+          <thead><tr><th>Date</th><th>Name</th><th>Email</th></tr></thead>
+          <tbody>${upcoming.map(m => `<tr>
+            <td class="sub">${esc(m.next_birthday ? new Date(m.next_birthday).toLocaleDateString('en-NG', { month: 'short', day: 'numeric' }) : '')}</td>
+            <td class="strong">${esc(m.full_name || '—')}</td>
+            <td class="sub">${esc(m.email)}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>` : `<div class="empty-state">No upcoming birthdays in the next 14 days.</div>`}
+      </div>
+
+      <div class="form-section">
+        <h3>Sent log <span style="color:var(--muted);font-weight:400">(latest ${sent.length})</span></h3>
+        ${sent.length ? `<div class="tbl-wrap"><table class="tbl">
+          <thead><tr><th>When</th><th>Name</th><th>Email</th><th>Status</th></tr></thead>
+          <tbody>${sent.map(r => `<tr>
+            <td class="sub">${fmtDate(r.sent_at)}</td>
+            <td class="strong">${esc(r.full_name || '—')}</td>
+            <td class="sub">${esc(r.email)}</td>
+            <td><span class="status-dot ${esc(r.status)}"></span>${esc(r.status)}${r.error ? `<br><span class="sub" style="color:#b33">${esc(r.error)}</span>` : ''}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>` : `<div class="empty-state">No birthday greetings have been sent yet.</div>`}
+      </div>
+    `;
+
+    const msg = $('#brMsg');
+    async function runJob(dry) {
+      msg.className = 'form-msg';
+      msg.textContent = '';
+      [$('#brRun'), $('#brDryRun')].forEach(b => b && (b.disabled = true));
+      try {
+        const r = await api('/api/admin/birthdays/run' + (dry ? '?dryRun=1' : ''), { method: 'POST' });
+        const res = r.result || {};
+        msg.className = 'form-msg ok';
+        msg.textContent = `${dry ? '(dry run) ' : ''}sent ${res.sent.length}, failed ${res.failed.length}, skipped ${res.skipped.length} ✓`;
+        if (!dry) setTimeout(renderBirthdays, 800);
+      } catch (err) {
+        msg.className = 'form-msg err';
+        msg.textContent = err.message;
+      } finally {
+        [$('#brRun'), $('#brDryRun')].forEach(b => b && (b.disabled = false));
+      }
+    }
+    $('#brRun') && $('#brRun').addEventListener('click', () => {
+      if (confirm('Send birthday greetings to everyone celebrating today?')) runJob(false);
+    });
+    $('#brDryRun') && $('#brDryRun').addEventListener('click', () => runJob(true));
   }
 
   // ---------------- modal ----------------
