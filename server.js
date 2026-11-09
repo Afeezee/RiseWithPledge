@@ -192,11 +192,12 @@ async function syncSubscriber({ email: addr, fullName, phone, source, metadata, 
 
   // Fire welcome email via configured provider (Resend by default, Brevo fallback).
   try {
-    await email.sendWelcome(source, {
+    const result = await email.sendWelcome(source, {
       email: addr,
       fullName,
       unsubscribeToken: subRow ? subRow.unsubscribe_token : null
     });
+    console.log('[subscribers] welcome email sent:', source, addr, 'via', email.providerName(), result && result.id ? 'id=' + result.id : '');
   } catch (err) {
     console.error('[subscribers] welcome email failed:', source, addr, err && err.message);
   }
@@ -667,19 +668,19 @@ app.post('/api/admin/campaigns', requireAdmin, async (req, res) => {
       scheduledAt: action === 'schedule' ? scheduledAt.toISOString() : null,
       sentBy: req.session.adminUser,
       recipientCount,
-      provider: email.providerName()
+      provider: email.providerName(),
+      htmlBody: action === 'schedule' ? body : null
     });
 
     if (action === 'schedule') {
-      // Simple MVP: record it; actual scheduled delivery on Resend uses a cron.
-      // For now we send immediately when "schedule" is picked with a future time
-      // on the Brevo provider only; Resend scheduling can be added later.
-      await pg.markCampaignScheduled(record.id, {
+      // The campaign row now holds subject + html_body + audience + scheduled_at.
+      // A separate scheduler (/api/cron/campaigns) picks it up when due.
+      return res.json({
+        ok: true, action: 'schedule',
         scheduledAt: scheduledAt.toISOString(),
         recipientCount,
-        brevoCampaignId: null
+        note: 'Scheduled. Will send on the next /api/cron/campaigns tick after ' + scheduledAt.toISOString() + '. Configure a cron (cron-job.org or Vercel Cron) to call that endpoint every 5 minutes.'
       });
-      return res.json({ ok: true, action: 'schedule', scheduledAt: scheduledAt.toISOString(), recipientCount, note: 'Scheduled campaigns run via Vercel Cron (see /api/cron/campaigns, not yet implemented). To send right now, pick "Send now".' });
     }
 
     // 2) Send (test or send-now) via the email abstraction.
@@ -785,6 +786,94 @@ app.get('/api/cron/birthdays', requireCron, async (req, res) => {
   } catch (err) {
     console.error('[cron birthdays]', err);
     res.status(500).json({ error: err.message || 'Birthday cron failed.' });
+  }
+});
+// Allow POST too so external cron services (cron-job.org) can hit it either way.
+app.post('/api/cron/birthdays', requireCron, async (req, res) => {
+  try {
+    const result = await runBirthdayJob();
+    res.json({ ok: true, result });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Birthday cron failed.' });
+  }
+});
+
+// ============================================================
+// SCHEDULED CAMPAIGNS (external cron picks these up)
+// ============================================================
+
+/**
+ * Send one scheduled campaign. Returns { id, sent, failed } or { id, error }.
+ * Uses optimistic locking via markCampaignSending so parallel cron hits don't
+ * double-send.
+ */
+async function sendScheduledCampaign(campaign) {
+  if (!(await pg.markCampaignSending(campaign.id))) {
+    return { id: campaign.id, skipped: 'already being sent' };
+  }
+  try {
+    const recipients = await pg.activeSubscribersForSources(campaign.audience || []);
+    if (!recipients.length) {
+      await pg.markCampaignSent(campaign.id, {
+        sentAt: new Date().toISOString(), recipientCount: 0, brevoCampaignId: null
+      });
+      return { id: campaign.id, sent: 0, failed: 0, note: 'no active recipients' };
+    }
+    const result = await email.sendCampaign({
+      subject: campaign.subject,
+      html: campaign.html_body || '',
+      recipients,
+      campaignId: campaign.id
+    });
+    await pg.markCampaignSent(campaign.id, {
+      sentAt: new Date().toISOString(),
+      recipientCount: result.sent,
+      brevoCampaignId: result.brevoCampaignId || null
+    });
+    return { id: campaign.id, sent: result.sent, failed: result.failed };
+  } catch (err) {
+    console.error('[campaign cron] send failed', campaign.id, err && err.message);
+    try { await pg.markCampaignFailed(campaign.id, err.message); } catch (_) { /* ignore */ }
+    return { id: campaign.id, error: err.message };
+  }
+}
+
+async function runScheduledCampaignsJob() {
+  if (!pg.enabled()) throw new Error('DATABASE_URL is not configured.');
+  if (!email.enabled()) throw new Error('No email provider is configured.');
+  const due = await pg.findDueScheduledCampaigns();
+  const results = [];
+  for (const c of due) results.push(await sendScheduledCampaign(c));
+  return { checkedAt: new Date().toISOString(), due: due.length, results };
+}
+
+app.get('/api/cron/campaigns', requireCron, async (req, res) => {
+  try {
+    const result = await runScheduledCampaignsJob();
+    if (result.due > 0) console.log('[cron campaigns]', result);
+    res.json({ ok: true, result });
+  } catch (err) {
+    console.error('[cron campaigns]', err);
+    res.status(500).json({ error: err.message || 'Campaign cron failed.' });
+  }
+});
+app.post('/api/cron/campaigns', requireCron, async (req, res) => {
+  try {
+    const result = await runScheduledCampaignsJob();
+    if (result.due > 0) console.log('[cron campaigns]', result);
+    res.json({ ok: true, result });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Campaign cron failed.' });
+  }
+});
+
+// Admin "run now" trigger — useful for testing without waiting for the cron.
+app.post('/api/admin/campaigns/run-scheduled', requireAdmin, async (req, res) => {
+  try {
+    const result = await runScheduledCampaignsJob();
+    res.json({ ok: true, result });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Run failed.' });
   }
 });
 

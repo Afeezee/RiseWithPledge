@@ -107,6 +107,45 @@ Once logged in, use **📣 Campaigns** in the sidebar to:
   `ADMIN_DIGEST_EMAIL` a summary of who was greeted.
 - An admin can also trigger a run on demand from **/admin → 🎂 Birthdays**.
 
+## Scheduled campaigns
+
+An admin can compose a campaign in **/admin → 📣 Campaigns** and pick
+**📅 Schedule** with a future date/time. The campaign is stored with
+`status='scheduled'` and the chosen UTC instant, and fires on the next
+run of `/api/cron/campaigns`.
+
+Two ways to configure the cron trigger:
+
+### Option A — cron-job.org (recommended, 5-minute granularity, free)
+
+Vercel's **Hobby** plan is limited to 2 cron jobs **running once per day**,
+which isn't fine-grained enough for user-picked schedule times. The
+workaround is an external cron service.
+
+1. Sign up at [cron-job.org](https://cron-job.org) (free).
+2. Create a new job:
+   - **URL**: `https://risewithpledge.org/api/cron/campaigns`
+   - **Method**: POST
+   - **Schedule**: every 5 minutes
+   - **Headers**: add `Authorization: Bearer <value of CRON_SECRET>`
+3. Save and enable. The job will tick every 5 minutes; due campaigns send;
+   when nothing is due the endpoint returns `{ due: 0 }` instantly.
+
+Repeat the same for `/api/cron/birthdays` on a daily schedule (e.g. 08:00
+Africa/Lagos) if you prefer external cron over Vercel Cron.
+
+### Option B — Vercel Cron (5 cron runs per day on Hobby)
+
+`vercel.json` already configures `/api/cron/birthdays` daily at 07:00 UTC.
+You can add a second entry for `/api/cron/campaigns` on Pro
+(e.g. `"schedule": "*/5 * * * *"`), but on Hobby the once-per-day limit
+means campaigns scheduled for 14:37 would land in the next daily tick.
+For responsive scheduled sends, use cron-job.org (Option A) alongside the
+Vercel birthday cron.
+
+An admin can also hit **⚡ Run due scheduled campaigns now** in the Campaigns
+view to force a check, useful for testing.
+
 ## Deployment notes (Vercel)
 
 - Set these env vars in **Project → Settings → Environment Variables**:

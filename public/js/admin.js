@@ -607,8 +607,14 @@
           <button class="btn btn-outline" type="button" data-action="schedule">📅 Schedule</button>
           <button class="btn btn-primary" type="button" data-action="send">📣 Send now</button>
         </div>
+        <p style="color:var(--muted);font-size:.85rem;margin-top:.6rem">Scheduled sends fire the next time <code>/api/cron/campaigns</code> is hit — configure cron-job.org or Vercel Cron to call it every 5 minutes. You can also run due jobs on demand below.</p>
         <div class="form-msg" id="campaignMsg"></div>
       </form>
+
+      <div class="form-section" style="margin-top:0">
+        <button class="btn btn-outline btn-sm" type="button" id="runSchedBtn">⚡ Run due scheduled campaigns now</button>
+        <div id="runSchedMsg" class="form-msg"></div>
+      </div>
 
       <div class="form-section">
         <h3>Send history</h3>
@@ -647,6 +653,26 @@
     wireDiag('#emailDiagBtn', '#emailDiagOut', '/api/admin/diagnostics/email');
     wireDiag('#brevoDiagBtn', '#brevoDiagOut', '/api/admin/diagnostics/brevo');
 
+    const rsBtn = $('#runSchedBtn');
+    const rsMsg = $('#runSchedMsg');
+    if (rsBtn) rsBtn.addEventListener('click', async () => {
+      rsBtn.disabled = true;
+      rsMsg.className = 'form-msg';
+      rsMsg.textContent = 'Checking…';
+      try {
+        const r = await api('/api/admin/campaigns/run-scheduled', { method: 'POST' });
+        const res = r.result || {};
+        rsMsg.className = 'form-msg ok';
+        rsMsg.textContent = res.due === 0 ? 'No due scheduled campaigns right now.' : `Ran ${res.due} scheduled campaign${res.due === 1 ? '' : 's'}.`;
+        if (res.due > 0) setTimeout(renderCampaigns, 800);
+      } catch (err) {
+        rsMsg.className = 'form-msg err';
+        rsMsg.textContent = err.message;
+      } finally {
+        rsBtn.disabled = false;
+      }
+    });
+
     const form = $('#campaignForm');
     const msg = $('#campaignMsg');
     form.querySelectorAll('button[data-action]').forEach(btn => {
@@ -662,7 +688,9 @@
           body: fd.get('body'),
           audience,
           testEmail: fd.get('testEmail'),
-          scheduledAt: fd.get('scheduledAt') || null
+          // datetime-local is naive local time; convert to a UTC ISO string
+          // so the server stores an unambiguous instant.
+          scheduledAt: fd.get('scheduledAt') ? new Date(fd.get('scheduledAt')).toISOString() : null
         };
         if (!payload.subject || !payload.body) {
           msg.className = 'form-msg err'; msg.textContent = 'Subject and body are required.'; return;
