@@ -315,6 +315,214 @@ h1{margin:0 0 12px;color:#0042ab}a{color:#0042ab}</style></head>
 </div></body></html>`);
 });
 
+// ---- Public per-item detail pages (shareable, with OG meta tags) ----
+// Facebook / WhatsApp / Twitter crawlers don't execute JS, so we
+// server-render the title, excerpt, and image into <meta> tags.
+const DETAIL_PAGES = {
+  stories: {
+    collection: 'stories',
+    kicker: 'Success Story',
+    titleField: 'title',
+    bodyField: 'content',
+    subField: 'personName',
+    dateField: 'date',
+    returnTo: '/#stories',
+    returnLabel: 'More stories'
+  },
+  news: {
+    collection: 'news',
+    kicker: 'News & Events',
+    titleField: 'title',
+    bodyField: 'content',
+    subField: 'category',
+    dateField: 'eventDate',
+    extraField: 'location',
+    returnTo: '/news',
+    returnLabel: 'All news & events'
+  },
+  projects: {
+    collection: 'projects',
+    kicker: 'Project',
+    titleField: 'title',
+    bodyField: 'description',
+    subField: 'status',
+    dateField: 'date',
+    extraField: 'location',
+    returnTo: '/projects',
+    returnLabel: 'All projects'
+  }
+};
+
+function escAttr(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/'/g, '&#39;');
+}
+function escHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function absoluteUrl(maybeRelative) {
+  if (!maybeRelative) return null;
+  if (/^https?:\/\//i.test(maybeRelative)) return maybeRelative;
+  const base = (process.env.SITE_URL || 'https://risewithpledge.org').replace(/\/$/, '');
+  return base + (maybeRelative.startsWith('/') ? maybeRelative : '/' + maybeRelative);
+}
+
+async function fetchDetailItem(collection, id) {
+  // UUID shape check so we don't query with junk
+  if (!/^[0-9a-f-]{32,}$/i.test(id)) return null;
+  // Try PG when configured; else fall back to JSON store
+  if (pg.enabled()) {
+    try {
+      const items = await pg.listContent(collection);
+      const row = items.find(x => x.id === id);
+      if (!row) return null;
+      return { id: row.id, ...(row.data || {}), file: row.file_url || null, fileType: row.file_type || null, createdAt: row.created_at };
+    } catch (err) {
+      console.error('[detail] pg fetch failed:', err && err.message);
+    }
+  }
+  const jsonDb = jsonStore.get();
+  return (jsonDb[collection] || []).find(x => x.id === id) || null;
+}
+
+function renderDetailPage(kind, item) {
+  const cfg = DETAIL_PAGES[kind];
+  const siteUrl = (process.env.SITE_URL || 'https://risewithpledge.org').replace(/\/$/, '');
+  const title = item[cfg.titleField] || 'Rise With Pledge Foundation';
+  const bodyRaw = item[cfg.bodyField] || '';
+  const sub = cfg.subField ? (item[cfg.subField] || '') : '';
+  const extra = cfg.extraField ? (item[cfg.extraField] || '') : '';
+  const date = cfg.dateField ? (item[cfg.dateField] || '') : '';
+  const imgUrl = absoluteUrl(item.file);
+  const ogImage = imgUrl || (siteUrl + '/img/og-default.png');
+  const pageUrl = siteUrl + '/' + kind + '/' + item.id;
+
+  // 200-char excerpt for meta description (first line, plain text)
+  const excerpt = (bodyRaw || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+
+  // Body paragraphs — split on blank lines, keep single newlines as <br>
+  const paragraphs = String(bodyRaw)
+    .split(/\n{2,}/)
+    .map(p => '<p>' + escHtml(p).replace(/\n/g, '<br>') + '</p>')
+    .join('\n');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escHtml(title)} — Rise With Pledge Foundation</title>
+  <meta name="description" content="${escAttr(excerpt)}">
+
+  <meta property="og:title" content="${escAttr(title)}">
+  <meta property="og:description" content="${escAttr(excerpt)}">
+  <meta property="og:image" content="${escAttr(ogImage)}">
+  <meta property="og:url" content="${escAttr(pageUrl)}">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Rise With Pledge Foundation">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="${escAttr(title)}">
+  <meta name="twitter:description" content="${escAttr(excerpt)}">
+  <meta name="twitter:image" content="${escAttr(ogImage)}">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700;800&family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <meta name="theme-color" content="#0042ab">
+  <style>
+    .detail-hero { aspect-ratio: 16/9; background:#eef1f7; border-radius:14px; overflow:hidden; margin: 1.2rem 0 2rem; }
+    .detail-hero img { width:100%; height:100%; object-fit:cover; display:block; }
+    .detail-article { max-width: 760px; margin: 0 auto; padding: 0 1rem; }
+    .detail-article h1 { font-size: clamp(1.8rem, 4vw, 2.6rem); line-height:1.15; margin:.4rem 0 .8rem; }
+    .detail-meta { color: var(--muted,#888); font-size:.95rem; margin-bottom: 1rem; }
+    .detail-body p { font-size:1.05rem; line-height:1.75; margin: 0 0 1.1rem; }
+    .share-row { display:flex; gap:.5rem; flex-wrap:wrap; margin: 2rem 0 .8rem; padding:1rem 0; border-top:1px solid var(--border,#e5e7eb); border-bottom:1px solid var(--border,#e5e7eb); }
+    .share-btn { display:inline-flex; align-items:center; gap:.4rem; padding:.55rem .9rem; border:1px solid var(--border,#e5e7eb); border-radius:999px; background:#fff; color:#333; text-decoration:none; font-size:.9rem; cursor:pointer; }
+    .share-btn:hover { border-color:#0042ab; color:#0042ab; }
+    .detail-nav { margin: 2rem 0 3rem; }
+  </style>
+</head>
+<body data-page="detail">
+  <article class="block">
+    <div class="detail-article">
+      <div class="breadcrumb"><a href="/">Home</a> / <a href="${escAttr(cfg.returnTo)}">${escHtml(cfg.kicker)}</a></div>
+      <h1>${escHtml(title)}</h1>
+      <div class="detail-meta">
+        ${sub ? `<span>${escHtml(sub)}</span>` : ''}
+        ${sub && (date || extra) ? ' · ' : ''}
+        ${date ? `<span>${escHtml(date)}</span>` : ''}
+        ${date && extra ? ' · ' : ''}
+        ${extra ? `<span>${escHtml(extra)}</span>` : ''}
+      </div>
+      ${imgUrl ? `<div class="detail-hero"><img src="${escAttr(imgUrl)}" alt="${escAttr(title)}"></div>` : ''}
+      <div class="detail-body">${paragraphs || '<p><em>No details yet.</em></p>'}</div>
+
+      <div class="share-row" id="shareRow">
+        <button class="share-btn" id="copyLinkBtn" type="button">🔗 Copy link</button>
+        <a class="share-btn" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(title + ' — ' + pageUrl)}">💬 WhatsApp</a>
+        <a class="share-btn" target="_blank" rel="noopener" href="https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(pageUrl)}">📘 Facebook</a>
+        <a class="share-btn" target="_blank" rel="noopener" href="https://twitter.com/intent/tweet?url=${encodeURIComponent(pageUrl)}&text=${encodeURIComponent(title)}">𝕏 Twitter</a>
+        <a class="share-btn" href="mailto:?subject=${encodeURIComponent(title)}&body=${encodeURIComponent(title + '\n\n' + pageUrl)}">✉ Email</a>
+      </div>
+
+      <div class="detail-nav">
+        <a class="btn btn-outline" href="${escAttr(cfg.returnTo)}">← ${escHtml(cfg.returnLabel)}</a>
+      </div>
+    </div>
+  </article>
+  <script src="/js/main.js"></script>
+  <script>
+    document.getElementById('copyLinkBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('copyLinkBtn');
+      const old = btn.textContent;
+      try { await navigator.clipboard.writeText(${JSON.stringify(pageUrl)}); btn.textContent = '✓ Copied!'; }
+      catch (_) { btn.textContent = 'Copy failed — select the URL manually'; }
+      setTimeout(() => { btn.textContent = old; }, 1800);
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function renderDetailNotFound(kind) {
+  const cfg = DETAIL_PAGES[kind];
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Not found — Rise With Pledge Foundation</title>
+<link rel="stylesheet" href="/css/style.css"></head>
+<body style="font-family:Arial,sans-serif;padding:48px 24px;text-align:center">
+<h1 style="color:#0042ab">We couldn't find that ${escHtml(cfg ? cfg.kicker : 'item').toLowerCase()}</h1>
+<p>The link may have expired or the item was removed.</p>
+<p><a href="/">← Return home</a></p>
+</body></html>`;
+}
+
+function mountDetailRoute(kind) {
+  app.get('/' + kind + '/:id', async (req, res) => {
+    const cfg = DETAIL_PAGES[kind];
+    try {
+      const item = await fetchDetailItem(cfg.collection, req.params.id);
+      if (!item) {
+        return res.status(404).set('Content-Type', 'text/html; charset=utf-8').send(renderDetailNotFound(kind));
+      }
+      res.set('Content-Type', 'text/html; charset=utf-8');
+      res.set('Cache-Control', 'public, max-age=120');
+      res.send(renderDetailPage(kind, item));
+    } catch (err) {
+      console.error('[detail]', kind, err);
+      res.status(500).set('Content-Type', 'text/html; charset=utf-8').send(renderDetailNotFound(kind));
+    }
+  });
+}
+mountDetailRoute('stories');
+mountDetailRoute('news');
+mountDetailRoute('projects');
+
 // ---- Email provider webhooks ----
 // Brevo (legacy): POST /api/webhooks/brevo?secret=…
 app.post('/api/webhooks/brevo', async (req, res) => {

@@ -17,6 +17,12 @@
     return isNaN(d) ? '' : d.toLocaleDateString('en-NG', { year: 'numeric', month: 'short', day: 'numeric' }) +
       ' · ' + d.toLocaleTimeString('en-NG', { hour: '2-digit', minute: '2-digit' });
   }
+  // Compact date just for a date-of-birth cell (no time, no year glitches for 1950s dates).
+  function fmtDobShort(ymd) {
+    if (!ymd) return '';
+    const d = new Date(ymd);
+    return isNaN(d) ? ymd : d.toLocaleDateString('en-NG', { day: 'numeric', month: 'short', year: 'numeric' });
+  }
   function toast(msg, isErr) {
     let t = $('.toast');
     if (!t) { t = document.createElement('div'); t.className = 'toast'; document.body.appendChild(t); }
@@ -58,9 +64,13 @@
     newsletter: { title: 'Newsletter Subscribers', desc: 'Email addresses subscribed to your newsletter.', statuses: null }
   };
 
+  // Which admin content views correspond to a public detail page.
+  // The detail page lives at /${SHARE_KIND[view]}/${id} and ships OG meta tags.
+  const SHARE_KIND = { stories: 'stories', news: 'news', projects: 'projects' };
+
   const CONTENT_VIEWS = {
     team: {
-      title: 'Team Members', desc: 'Profiles shown on the About page — founder, board of trustees, management, coordinators, volunteers and advisors.',
+      title: 'Team Members', desc: 'Upload the founder, board of trustees, management, programme coordinators, and volunteers/advisors shown on the About page. Each person is a separate team member — add them one at a time, each with their own photo, role, and bio. The Category field controls which section of the About page they appear in.',
       addLabel: '+ Add Team Member', fileLabel: 'Photograph', fileAccept: 'image/*',
       fields: [
         ['name', 'Full Name', 'text', true],
@@ -239,6 +249,28 @@
       ? ['Email', 'Subscribed', '']
       : ['Name', 'Contact', 'Received', 'Status', ''];
 
+    // Pick the most useful sub-line per view so the owner can scan the list
+    // without opening every row. Volunteers in particular need "area of interest"
+    // visible because that's what she uses to assign them + issue certificates.
+    function subLine(x) {
+      if (view === 'members') {
+        const dob = x.dateOfBirth ? 'DOB: ' + fmtDobShort(x.dateOfBirth) : '';
+        return [dob, x.occupation].filter(Boolean).join(' · ');
+      }
+      if (view === 'volunteers') {
+        const area = x.areas ? '🙋 ' + x.areas : '';
+        return [area, x.category].filter(Boolean).join(' · ');
+      }
+      if (view === 'pledges') {
+        return [x.occasion, x.supportType].filter(Boolean).join(' · ');
+      }
+      if (view === 'partners_enquiries') {
+        return [x.organisation, x.partnershipType].filter(Boolean).join(' · ');
+      }
+      if (view === 'contacts') return x.subject || '';
+      return x.occasion || x.category || x.subject || x.occupation || '';
+    }
+
     function row(x) {
       if (view === 'newsletter') {
         return `<tr>
@@ -248,8 +280,9 @@
             <button class="icon-btn danger" data-del="${x.id}" title="Remove">🗑</button>
           </div></td></tr>`;
       }
+      const sub = subLine(x);
       return `<tr>
-        <td><span class="strong">${esc(x.name)}</span><br><span class="sub">${esc(x.occasion || x.category || x.subject || x.occupation || '')}</span></td>
+        <td><span class="strong">${esc(x.name)}</span><br><span class="sub" title="${esc(sub)}">${esc(sub)}</span></td>
         <td class="sub">${esc(x.email)}<br>${esc(x.phone || '')}</td>
         <td class="sub">${fmtDate(x.date)}</td>
         <td><select class="status" data-status="${x.id}">
@@ -341,6 +374,7 @@
       ${items.length ? `<div class="content-grid">
         ${items.map(x => {
           const c = spec.card(x);
+          const shareKind = SHARE_KIND[view];
           return `<div class="c-card">
             <div class="c-thumb">${c.img ? `<img src="${esc(c.img)}" alt="">` : c.icon}</div>
             <div class="c-body"><b>${esc(c.title)}</b><span>${esc(c.sub || '')}</span></div>
@@ -348,10 +382,19 @@
               <button class="icon-btn" data-edit="${x.id}" title="Edit">✏️</button>
               <button class="icon-btn danger" data-del="${x.id}" title="Delete">🗑</button>
               ${x.file ? `<a class="icon-btn" href="${esc(x.file)}" target="_blank" title="Open file">🔗</a>` : ''}
+              ${shareKind ? `<button class="icon-btn" data-share-kind="${shareKind}" data-share-id="${x.id}" title="Copy shareable link">📋</button>` : ''}
             </div>
           </div>`;
         }).join('')}
       </div>` : `<div class="empty-state">Nothing added yet — click “${spec.addLabel.replace('+ ', '')}” to publish your first entry.</div>`}`;
+
+    wrap().querySelectorAll('[data-share-kind]').forEach(btn => btn.addEventListener('click', async () => {
+      const kind = btn.dataset.shareKind;
+      const id = btn.dataset.shareId;
+      const url = location.origin + '/' + kind + '/' + id;
+      try { await navigator.clipboard.writeText(url); toast('Shareable link copied ✓'); }
+      catch (_) { prompt('Copy this link:', url); }
+    }));
 
     $('#addBtn').addEventListener('click', () => contentForm(view, null));
     wrap().querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => {
@@ -453,10 +496,12 @@
         <div class="form-section">
           <h3>📞 Contact Information</h3>
           <div class="fields-2">
-            ${F('email', 'Email Address', s.email)}
+            ${F('customEmail', 'Primary Email (custom domain)', s.customEmail || '')}
+            ${F('email', 'Secondary Email (alternate inbox)', s.email)}
             ${F('phone', 'Phone Number', s.phone)}
             ${F('address', 'Office Address', s.address)}
           </div>
+          <p style="color:var(--muted);font-size:.85rem;margin-top:.4rem">The Primary Email is shown first on the Contact page and in the site footer. The Secondary Email appears as an alternate. Leave Primary blank to show only the Secondary.</p>
         </div>
         <div class="form-section">
           <h3>🌐 Social Media</h3>

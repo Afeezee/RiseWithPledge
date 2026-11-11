@@ -211,8 +211,11 @@
     const s = CONTENT.settings || {};
     const fc = document.getElementById('footerContact');
     if (fc) {
+      const primary = s.customEmail || s.email;
+      const secondary = s.customEmail && s.email && s.email !== s.customEmail ? s.email : null;
       fc.innerHTML = `
-        <li>${ICONS.mail}<a href="mailto:${esc(s.email)}">${esc(s.email)}</a></li>
+        <li>${ICONS.mail}<a href="mailto:${esc(primary)}">${esc(primary)}</a></li>
+        ${secondary ? `<li>${ICONS.mail}<a href="mailto:${esc(secondary)}">${esc(secondary)}</a></li>` : ''}
         <li>${ICONS.phone}<a href="tel:${esc(s.phone)}">${esc(s.phone)}</a></li>
         <li>${ICONS.pin}<span>${esc(s.address || 'Nigeria')}</span></li>`;
     }
@@ -226,7 +229,7 @@
       fs.innerHTML = `
         <a href="${esc(s.instagram)}" target="_blank" rel="noopener" aria-label="Instagram">${ICONS.ig}</a>
         <a href="${esc(s.facebook)}" target="_blank" rel="noopener" aria-label="Facebook">${ICONS.fb}</a>
-        <a href="mailto:${esc(s.email)}" aria-label="Email">${ICONS.mail}</a>`;
+        <a href="mailto:${esc(s.customEmail || s.email)}" aria-label="Email">${ICONS.mail}</a>`;
     }
     bindCopyButtons();
   }
@@ -301,12 +304,16 @@
   // ---------------- page renderers ----------------
   const PH_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg>';
 
+  // Clickable-card helpers. Each card links to /stories/:id | /news/:id | /projects/:id
+  // where the server renders a full detail page with OG meta tags for social sharing.
+  function detailHref(kind, id) { return id ? '/' + kind + '/' + encodeURIComponent(id) : '#'; }
+
   function projectCard(p) {
     const badge = `<span class="badge ${esc(p.status || 'ongoing')}">${esc(p.status || 'ongoing')}</span>`;
     const img = p.file
       ? `<img src="${esc(p.file)}" alt="${esc(p.title)}" loading="lazy">`
       : `<div class="ph">${PH_SVG}</div>`;
-    return `<article class="card proj-card reveal">
+    return `<a class="card-link" href="${esc(detailHref('projects', p.id))}"><article class="card proj-card reveal">
       <div class="thumb">${img}</div>
       <div class="body">
         ${badge}
@@ -314,12 +321,12 @@
         <p>${esc((p.description || '').slice(0, 160))}${(p.description || '').length > 160 ? '…' : ''}</p>
         <div class="meta">${p.location ? '📍 ' + esc(p.location) : ''} ${p.date ? '🗓 ' + esc(p.date) : ''}</div>
       </div>
-    </article>`;
+    </article></a>`;
   }
 
   function newsCard(n) {
     const img = n.file ? `<img src="${esc(n.file)}" alt="${esc(n.title)}" loading="lazy">` : `<div class="ph">${PH_SVG}</div>`;
-    return `<article class="card proj-card reveal">
+    return `<a class="card-link" href="${esc(detailHref('news', n.id))}"><article class="card proj-card reveal">
       <div class="thumb">${img}</div>
       <div class="body">
         <span class="badge upcoming">${esc(n.category || 'News')}</span>
@@ -327,19 +334,19 @@
         <p>${esc((n.content || '').slice(0, 150))}${(n.content || '').length > 150 ? '…' : ''}</p>
         <div class="meta">${n.eventDate ? '🗓 ' + esc(n.eventDate) : '🗓 ' + fmtDate(n.createdAt)} ${n.location ? '· 📍 ' + esc(n.location) : ''}</div>
       </div>
-    </article>`;
+    </article></a>`;
   }
 
   function storyCard(s) {
     const img = s.file ? `<img src="${esc(s.file)}" alt="${esc(s.title)}" loading="lazy">` : `<div class="ph">${PH_SVG}</div>`;
-    return `<article class="card proj-card reveal">
+    return `<a class="card-link" href="${esc(detailHref('stories', s.id))}"><article class="card proj-card reveal">
       <div class="thumb">${img}</div>
       <div class="body">
         <h3>${esc(s.title)}</h3>
         <p>${esc((s.content || '').slice(0, 170))}${(s.content || '').length > 170 ? '…' : ''}</p>
-        <div class="meta">${s.personName ? '— ' + esc(s.personName) : ''}</div>
+        <div class="meta">${s.personName ? '— ' + esc(s.personName) : ''} <span class="read-more">Read full story →</span></div>
       </div>
-    </article>`;
+    </article></a>`;
   }
 
   function teamCard(t) {
@@ -397,8 +404,8 @@
       const coord = by('coordinator');
       const vols = by('volunteer-advisor');
 
-      renderInto('teamFounder', founder.map(teamCard).join('') ||
-        teamCard({ name: 'Barrister Abimbola Adebayo, Esq.', role: 'Founder / Executive Director' }), '');
+      renderInto('teamFounder', founder.map(teamCard).join(''),
+        'The founder’s profile will be displayed here.');
       renderInto('teamBoard', board.map(teamCard).join(''),
         'Board members’ profiles, photographs, and professional backgrounds will be displayed here.');
       renderInto('teamMgmt', mgmt.map(teamCard).join(''),
@@ -510,8 +517,16 @@
       const s = CONTENT.settings || {};
       const list = document.getElementById('contactInfo');
       if (list) {
+        // When a custom email is set, show it as the primary address and
+        // keep the gmail below as an alternate.
+        const primary = s.customEmail || s.email;
+        const secondary = s.customEmail && s.email && s.email !== s.customEmail ? s.email : null;
+        const emailHtml = secondary
+          ? `<p><a href="mailto:${esc(primary)}">${esc(primary)}</a><br>
+             <span style="color:var(--muted);font-size:.9rem">or <a href="mailto:${esc(secondary)}">${esc(secondary)}</a></span></p>`
+          : `<p><a href="mailto:${esc(primary)}">${esc(primary)}</a></p>`;
         list.innerHTML = `
-          <div class="card reveal"><div class="icon-bubble">${ICONS.mail}</div><h3>Email Us</h3><p><a href="mailto:${esc(s.email)}">${esc(s.email)}</a></p></div>
+          <div class="card reveal"><div class="icon-bubble">${ICONS.mail}</div><h3>Email Us</h3>${emailHtml}</div>
           <div class="card reveal"><div class="icon-bubble">${ICONS.phone}</div><h3>Call Us</h3><p><a href="tel:${esc(s.phone)}">${esc(s.phone)}</a></p></div>
           <div class="card reveal"><div class="icon-bubble">${ICONS.pin}</div><h3>Visit Us</h3><p>${esc(s.address || 'Nigeria')}</p></div>
           <div class="card reveal"><div class="icon-bubble">${ICONS.ig}</div><h3>Follow Us</h3>
